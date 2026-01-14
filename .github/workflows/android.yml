@@ -1,4 +1,4 @@
-name: Android Build
+name: CI Build
 
 on:
   pull_request:
@@ -37,5 +37,6 @@ jobs:
         with:
           name: sing-box-android-apk
           path: app/build/outputs/apk/release/*.apk
+
 
 
