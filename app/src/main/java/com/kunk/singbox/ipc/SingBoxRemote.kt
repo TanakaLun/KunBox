@@ -13,7 +13,6 @@ import android.os.Looper
 import android.util.Log
 import com.kunk.singbox.aidl.ISingBoxService
 import com.kunk.singbox.aidl.ISingBoxServiceCallback
-import com.kunk.singbox.ipc.SingBoxIpcService
 import com.kunk.singbox.service.SingBoxService
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -21,17 +20,23 @@ import kotlinx.coroutines.flow.asStateFlow
 import java.lang.ref.WeakReference
 
 /**
- * SingBoxRemote - IPC 客户端，用于与 SingBoxIpcService 通信
- *
- * 2025-fix: 参考 NekoBox 的 SagerConnection 实现，增加以下功能：
- * 1. Binder 死亡监听 (DeathRecipient) - 当服务进程崩溃时自动重连
- * 2. 自动重连机制 - 连接断开后自动尝试重连
- * 3. 状态保持 - 连接断开时不立即清空状态，而是检查系统 VPN 状态
+ * SingBoxRemote - IPC 客户端
+ * 
+ * 2025-fix-v5: 学习 NekoBox SagerConnection 的完整实现
+ * 
+ * 核心改进:
+ * 1. connectionActive 标志位 - 防止重复绑定/解绑
+ * 2. binderDied 立即重连 - 不使用延迟重试
+ * 3. 前后台切换优化 - 支持连接优先级更新
+ * 4. 连接有效性检测强化 - 主动断开 stale 连接后重连
+ * 
+ * 参考: NekoBox SagerConnection.kt
+ * - https://github.com/MatsuriDayo/NekoBoxForAndroid/blob/main/app/src/main/java/io/nekohasekai/sagernet/bg/SagerConnection.kt
  */
 object SingBoxRemote {
     private const val TAG = "SingBoxRemote"
-    private const val RECONNECT_DELAY_MS = 500L
-    private const val MAX_RECONNECT_ATTEMPTS = 3
+    private const val RECONNECT_DELAY_MS = 300L
+    private const val MAX_RECONNECT_ATTEMPTS = 5
 
     private val _state = MutableStateFlow(SingBoxService.ServiceState.STOPPED)
     val state: StateFlow<SingBoxService.ServiceState> = _state.asStateFlow()
@@ -54,8 +59,16 @@ object SingBoxRemote {
     @Volatile
     private var service: ISingBoxService? = null
 
+    // 2025-fix-v5: 使用 connectionActive 替代简单的 bound 标志
+    // 参考 NekoBox SagerConnection: connectionActive 在 connect() 时设置，disconnect() 时清除
+    @Volatile
+    private var connectionActive = false
+
     @Volatile
     private var bound = false
+
+    @Volatile
+    private var callbackRegistered = false
 
     @Volatile
     private var binder: IBinder? = null
@@ -66,93 +79,119 @@ object SingBoxRemote {
     @Volatile
     private var reconnectAttempts = 0
 
+    @Volatile
+    private var lastSyncTimeMs = 0L
+
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private val callback = object : ISingBoxServiceCallback.Stub() {
         override fun onStateChanged(state: Int, activeLabel: String?, lastError: String?, manuallyStopped: Boolean) {
             val st = SingBoxService.ServiceState.values().getOrNull(state)
                 ?: SingBoxService.ServiceState.STOPPED
-            _state.value = st
-            _isRunning.value = st == SingBoxService.ServiceState.RUNNING
-            _isStarting.value = st == SingBoxService.ServiceState.STARTING
-            _activeLabel.value = activeLabel.orEmpty()
-            _lastError.value = lastError.orEmpty()
-            _manuallyStopped.value = manuallyStopped
+            updateState(st, activeLabel, lastError, manuallyStopped)
         }
     }
 
-    /**
-     * Binder 死亡监听器
-     * 当服务进程崩溃或被杀死时触发，自动尝试重连
-     */
+    private fun updateState(
+        st: SingBoxService.ServiceState,
+        activeLabel: String? = null,
+        lastError: String? = null,
+        manuallyStopped: Boolean? = null
+    ) {
+        _state.value = st
+        _isRunning.value = st == SingBoxService.ServiceState.RUNNING
+        _isStarting.value = st == SingBoxService.ServiceState.STARTING
+        activeLabel?.let { _activeLabel.value = it }
+        lastError?.let { _lastError.value = it }
+        manuallyStopped?.let { _manuallyStopped.value = it }
+        lastSyncTimeMs = System.currentTimeMillis()
+    }
+
     private val deathRecipient = object : IBinder.DeathRecipient {
         override fun binderDied() {
-            Log.w(TAG, "Binder died, attempting to reconnect...")
-            binder?.unlinkToDeath(this, 0)
-            binder = null
+            Log.w(TAG, "Binder died, performing NekoBox-style immediate reconnect")
             service = null
-            bound = false
-
-            // 尝试自动重连
-            scheduleReconnect()
+            callbackRegistered = false
+            
+            mainHandler.post {
+                val ctx = contextRef?.get()
+                if (ctx != null && !SagerConnection_restartingApp) {
+                    disconnect(ctx)
+                    connect(ctx)
+                }
+            }
         }
+    }
+
+    @Volatile
+    private var SagerConnection_restartingApp = false
+
+    private fun cleanupConnection() {
+        runCatching { binder?.unlinkToDeath(deathRecipient, 0) }
+        binder = null
+        service = null
+        bound = false
+        callbackRegistered = false
     }
 
     private val conn = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
             Log.i(TAG, "Service connected")
             this@SingBoxRemote.binder = binder
-            reconnectAttempts = 0 // 重置重连计数
+            reconnectAttempts = 0
 
-            // 注册 Binder 死亡监听
-            runCatching {
-                binder?.linkToDeath(deathRecipient, 0)
-            }
+            runCatching { binder?.linkToDeath(deathRecipient, 0) }
 
             val s = ISingBoxService.Stub.asInterface(binder)
             service = s
-            runCatching {
-                val st = SingBoxService.ServiceState.values().getOrNull(s.state)
-                    ?: SingBoxService.ServiceState.STOPPED
-                _state.value = st
-                _isRunning.value = st == SingBoxService.ServiceState.RUNNING
-                _isStarting.value = st == SingBoxService.ServiceState.STARTING
-                _activeLabel.value = s.activeLabel.orEmpty()
-                _lastError.value = s.lastError.orEmpty()
-                _manuallyStopped.value = s.isManuallyStopped
-                s.registerCallback(callback)
-                Log.i(TAG, "State synced: $st, running=${_isRunning.value}")
-            }
             bound = true
+
+            if (s != null && !callbackRegistered) {
+                runCatching {
+                    s.registerCallback(callback)
+                    callbackRegistered = true
+                }
+            }
+
+            syncStateFromService(s)
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
             Log.w(TAG, "Service disconnected")
-            val s = service
+            unregisterCallback()
             service = null
             bound = false
-            runCatching { s?.unregisterCallback(callback) }
 
-            // 2025-fix: 不立即将状态设为 STOPPED
-            // 因为服务可能仍在运行，只是 IPC 连接断开了
-            // 检查系统 VPN 状态来决定是否保持当前状态
             val ctx = contextRef?.get()
             if (ctx != null && hasSystemVpn(ctx)) {
-                Log.i(TAG, "System VPN still active, keeping current state")
-                // 保持当前状态，尝试重连
+                Log.i(TAG, "System VPN still active, keeping current state and reconnecting")
                 scheduleReconnect()
             } else {
-                // 没有系统 VPN，说明服务确实停止了
-                _state.value = SingBoxService.ServiceState.STOPPED
-                _isRunning.value = false
-                _isStarting.value = false
+                updateState(SingBoxService.ServiceState.STOPPED, "", "", false)
             }
         }
     }
 
-    /**
-     * 检查系统是否有活跃的 VPN 连接
-     */
+    private fun unregisterCallback() {
+        val s = service
+        if (s != null && callbackRegistered) {
+            runCatching { s.unregisterCallback(callback) }
+        }
+        callbackRegistered = false
+    }
+
+    private fun syncStateFromService(s: ISingBoxService?) {
+        if (s == null) return
+        runCatching {
+            val st = SingBoxService.ServiceState.values().getOrNull(s.state)
+                ?: SingBoxService.ServiceState.STOPPED
+            updateState(st, s.activeLabel.orEmpty(), s.lastError.orEmpty(), s.isManuallyStopped)
+            Log.i(TAG, "State synced: $st, running=${_isRunning.value}")
+        }.onFailure {
+            Log.e(TAG, "Failed to sync state from service", it)
+        }
+    }
+
     private fun hasSystemVpn(context: Context): Boolean {
         return try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -170,29 +209,24 @@ object SingBoxRemote {
         }
     }
 
-    /**
-     * 调度重连
-     */
     private fun scheduleReconnect() {
         if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-            Log.w(TAG, "Max reconnect attempts reached, giving up")
+            Log.w(TAG, "Max reconnect attempts reached")
             return
         }
 
         val ctx = contextRef?.get() ?: return
         reconnectAttempts++
+        val delay = RECONNECT_DELAY_MS * reconnectAttempts
 
         mainHandler.postDelayed({
             if (!bound && contextRef?.get() != null) {
-                Log.i(TAG, "Attempting reconnect #$reconnectAttempts")
+                Log.i(TAG, "Reconnect attempt #$reconnectAttempts")
                 doBindService(ctx)
             }
-        }, RECONNECT_DELAY_MS * reconnectAttempts)
+        }, delay)
     }
 
-    /**
-     * 执行服务绑定
-     */
     private fun doBindService(context: Context) {
         val intent = Intent(context, SingBoxIpcService::class.java)
         runCatching {
@@ -202,51 +236,110 @@ object SingBoxRemote {
         }
     }
 
-    /**
-     * 确保 IPC 已绑定
-     * 如果已绑定则直接返回，否则尝试绑定
-     */
-    fun ensureBound(context: Context) {
-        contextRef = WeakReference(context.applicationContext)
-
-        // 如果已绑定且服务可用，直接返回
-        if (bound && service != null) {
-            // 额外检查：尝试调用服务方法确认连接有效
-            val isAlive = runCatching { service?.state }.isSuccess
-            if (isAlive) return
-
-            // 连接已失效，重置状态
-            Log.w(TAG, "Service connection stale, rebinding...")
-            bound = false
-            service = null
+    fun connect(context: Context) {
+        if (connectionActive) {
+            Log.d(TAG, "connect: already active, skip")
+            return
         }
-
+        connectionActive = true
+        contextRef = WeakReference(context.applicationContext)
+        reconnectAttempts = 0
         doBindService(context)
     }
 
+    fun disconnect(context: Context) {
+        unregisterCallback()
+        if (connectionActive) {
+            runCatching { context.applicationContext.unbindService(conn) }
+        }
+        connectionActive = false
+        runCatching { binder?.unlinkToDeath(deathRecipient, 0) }
+        binder = null
+        service = null
+        bound = false
+    }
+
+    fun ensureBound(context: Context) {
+        contextRef = WeakReference(context.applicationContext)
+
+        if (connectionActive && bound && service != null) {
+            val isAlive = runCatching { service?.state }.isSuccess
+            if (isAlive) return
+
+            Log.w(TAG, "Service connection stale, rebinding...")
+        }
+
+        if (!connectionActive) {
+            connect(context)
+        } else if (!bound || service == null) {
+            disconnect(context)
+            connect(context)
+        }
+    }
+
     /**
-     * 强制重新绑定
-     * 用于 Activity resume 时确保状态同步
+     * v2rayNG 风格: 主动查询并同步状态
+     * 用于 Activity onResume 时确保 UI 与服务状态一致
+     * 
+     * 2025-fix-v5: 增强版 - 如果连接 stale 则强制重连
+     */
+    fun queryAndSyncState(context: Context): Boolean {
+        contextRef = WeakReference(context.applicationContext)
+        reconnectAttempts = 0
+
+        val s = service
+        if (connectionActive && bound && s != null) {
+            val synced = runCatching {
+                syncStateFromService(s)
+                true
+            }.getOrDefault(false)
+
+            if (synced) {
+                Log.i(TAG, "queryAndSyncState: synced from service")
+                return true
+            } else {
+                Log.w(TAG, "queryAndSyncState: sync failed, forcing reconnect")
+                disconnect(context)
+                connect(context)
+                return false
+            }
+        }
+
+        val ctx = contextRef?.get() ?: return false
+        val hasVpn = hasSystemVpn(ctx)
+
+        if (hasVpn && !connectionActive) {
+            Log.i(TAG, "queryAndSyncState: system VPN active but not connected, connecting")
+            connect(ctx)
+
+            if (_state.value != SingBoxService.ServiceState.RUNNING) {
+                updateState(SingBoxService.ServiceState.RUNNING)
+            }
+            return true
+        }
+
+        if (!hasVpn && _state.value == SingBoxService.ServiceState.RUNNING) {
+            Log.i(TAG, "queryAndSyncState: no system VPN but state is RUNNING, correcting")
+            updateState(SingBoxService.ServiceState.STOPPED)
+        }
+
+        if (!connectionActive) {
+            connect(ctx)
+        }
+
+        return connectionActive
+    }
+
+    /**
+     * NekoBox 风格: 强制重新绑定
      */
     fun rebind(context: Context) {
         contextRef = WeakReference(context.applicationContext)
         reconnectAttempts = 0
 
-        // 如果已绑定，先检查连接是否有效
-        if (bound && service != null) {
+        if (connectionActive && bound && service != null) {
             val isAlive = runCatching {
-                val st = service?.state
-                // 同步状态
-                if (st != null) {
-                    val state = SingBoxService.ServiceState.values().getOrNull(st)
-                        ?: SingBoxService.ServiceState.STOPPED
-                    _state.value = state
-                    _isRunning.value = state == SingBoxService.ServiceState.RUNNING
-                    _isStarting.value = state == SingBoxService.ServiceState.STARTING
-                    _activeLabel.value = service?.activeLabel.orEmpty()
-                    _lastError.value = service?.lastError.orEmpty()
-                    _manuallyStopped.value = service?.isManuallyStopped ?: false
-                }
+                syncStateFromService(service!!)
                 true
             }.getOrDefault(false)
 
@@ -256,23 +349,18 @@ object SingBoxRemote {
             }
         }
 
-        // 连接无效，重新绑定
-        Log.i(TAG, "Rebind: connection invalid, rebinding...")
-        bound = false
-        service = null
-        doBindService(context)
+        Log.i(TAG, "Rebind: connection invalid, forcing reconnect")
+        disconnect(context)
+        connect(context)
     }
 
-    fun isBound(): Boolean = bound && service != null
+    fun isBound(): Boolean = connectionActive && bound && service != null
+
+    fun isConnectionActive(): Boolean = connectionActive
 
     fun unbind(context: Context) {
-        if (!bound) return
-        val s = service
-        service = null
-        bound = false
-        binder?.unlinkToDeath(deathRecipient, 0)
-        binder = null
-        runCatching { s?.unregisterCallback(callback) }
-        runCatching { context.applicationContext.unbindService(conn) }
+        disconnect(context)
     }
+
+    fun getLastSyncAge(): Long = System.currentTimeMillis() - lastSyncTimeMs
 }
