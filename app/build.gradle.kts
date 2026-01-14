@@ -255,38 +255,8 @@ android {
         resConfigs("zh", "en") // 仅保留中文和英文资源，减少体积
     }
 
-    signingConfigs {
-        create("release") {
-            val props = Properties()
-            val propsFile = rootProject.file("signing.properties")
-            if (propsFile.exists()) {
-                // 本地开发：从 signing.properties 文件读取
-                props.load(propsFile.inputStream())
-                storeFile = rootProject.file(props.getProperty("STORE_FILE"))
-                storePassword = props.getProperty("KEYSTORE_PASSWORD")
-                keyAlias = props.getProperty("KEY_ALIAS")
-                keyPassword = props.getProperty("KEY_PASSWORD")
-            } else {
-                // CI 环境：从环境变量读取签名配置
-                val keystorePath = System.getenv("KEYSTORE_PATH")
-                val keystorePassword = System.getenv("KEYSTORE_PASSWORD")
-                val keyAliasEnv = System.getenv("KEY_ALIAS")
-                val keyPasswordEnv = System.getenv("KEY_PASSWORD")
-                
-                if (keystorePath != null) {
-                    storeFile = File(keystorePath)
-                    storePassword = keystorePassword
-                    keyAlias = keyAliasEnv
-                    keyPassword = keyPasswordEnv
-                }
-            }
-
-        }
-    }
-
     buildTypes {
         release {
-            signingConfig = signingConfigs.getByName("release")
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(
