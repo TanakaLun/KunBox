@@ -35,8 +35,9 @@ jobs:
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sing-box-android-apk
+          name: KunBox-Release-APK
           path: app/build/outputs/apk/release/*.apk
+
 
 
 
