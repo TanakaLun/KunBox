@@ -12,12 +12,15 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -44,6 +47,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.Divider
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -63,6 +67,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.foundation.text.ClickableText
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.ExpandLess
 import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.RadioButtonChecked
@@ -222,9 +227,11 @@ fun AppMultiSelectDialog(
     selectedPackages: Set<String>,
     confirmText: String = stringResource(R.string.common_ok),
     enableQuickSelectCommonApps: Boolean = false,
+    quickSelectExcludeCommonApps: Boolean = false,
     onConfirm: (List<String>) -> Unit,
     onDismiss: () -> Unit
 ) {
+
     // 内部数据类，用于增强应用信息（添加 hasLauncher 属性）
     data class EnhancedApp(
         val label: String,
@@ -297,7 +304,18 @@ fun AppMultiSelectDialog(
         )
     }
 
-    val filteredApps = remember(query, showSystemApps, showNoLauncherApps, allApps) {
+    val commonMatches = remember(allApps, commonExactPackages, commonPrefixPackages) {
+        allApps
+            .asSequence()
+            .map { it.packageName }
+            .filter { pkg ->
+                pkg in commonExactPackages || commonPrefixPackages.any { prefix -> pkg.startsWith(prefix) }
+            }
+            .toSet()
+    }
+
+    val filteredApps = remember(query, showSystemApps, showNoLauncherApps, allApps, tempSelected) {
+
         val q = query.trim().lowercase()
         allApps
             .asSequence()
@@ -307,14 +325,20 @@ fun AppMultiSelectDialog(
                 q.isEmpty() || it.label.lowercase().contains(q) || it.packageName.lowercase().contains(q)
             }
             .toList()
+            .sortedWith(
+                compareByDescending<EnhancedApp> { tempSelected.contains(it.packageName) }
+                    .thenBy { it.label.lowercase() }
+            )
     }
+
 
     Dialog(onDismissRequest = onDismiss) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
+                .fillMaxHeight(0.92f)
                 .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(28.dp))
-                .padding(24.dp)
+                .padding(16.dp)
         ) {
             Text(
                 text = title,
@@ -323,9 +347,10 @@ fun AppMultiSelectDialog(
                 color = MaterialTheme.colorScheme.onSurface
             )
 
-            Spacer(modifier = Modifier.height(16.dp))
+            Spacer(modifier = Modifier.height(8.dp))
             
             // 如果正在加载，显示加载进度
+
             if (loadingState is InstalledAppsRepository.LoadingState.Loading) {
                 val loading = loadingState as InstalledAppsRepository.LoadingState.Loading
                 Column(
@@ -365,89 +390,105 @@ fun AppMultiSelectDialog(
             OutlinedTextField(
                 value = query,
                 onValueChange = { query = it },
-                placeholder = { Text(stringResource(R.string.app_list_search_hint), color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)) },
+                placeholder = { Text(stringResource(R.string.app_list_search_hint), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)) },
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true,
+                textStyle = MaterialTheme.typography.bodyMedium,
                 colors = OutlinedTextFieldDefaults.colors(
                     focusedTextColor = MaterialTheme.colorScheme.onSurface,
                     unfocusedTextColor = MaterialTheme.colorScheme.onSurface,
                     focusedBorderColor = MaterialTheme.colorScheme.primary,
                     unfocusedBorderColor = MaterialTheme.colorScheme.outline,
                     focusedLabelColor = MaterialTheme.colorScheme.primary,
-                    unfocusedLabelColor = MaterialTheme.colorScheme.onSurfaceVariant
+                    unfocusedLabelColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                    cursorColor = MaterialTheme.colorScheme.primary
                 ),
-                shape = RoundedCornerShape(16.dp)
+                shape = RoundedCornerShape(12.dp)
             )
 
-            Spacer(modifier = Modifier.height(16.dp))
-
+            Spacer(modifier = Modifier.height(8.dp))
+ 
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(stringResource(R.string.app_list_show_system), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
-                Switch(
-                    checked = showSystemApps,
-                    onCheckedChange = { showSystemApps = it },
-                    colors = SwitchDefaults.colors(
-                        checkedThumbColor = MaterialTheme.colorScheme.onPrimary,
-                        checkedTrackColor = MaterialTheme.colorScheme.primary,
-                        uncheckedThumbColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                        uncheckedTrackColor = MaterialTheme.colorScheme.outline
+                Row(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable { showSystemApps = !showSystemApps }
+                        .padding(4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Checkbox(
+                        checked = showSystemApps,
+                        onCheckedChange = { showSystemApps = it },
+                        modifier = Modifier.scale(0.8f).size(16.dp)
                     )
-                )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(stringResource(R.string.app_list_show_system), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                
+                Spacer(modifier = Modifier.width(8.dp))
+
+                Row(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable { showNoLauncherApps = !showNoLauncherApps }
+                        .padding(4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Checkbox(
+                        checked = showNoLauncherApps,
+                        onCheckedChange = { showNoLauncherApps = it },
+                        modifier = Modifier.scale(0.8f).size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(stringResource(R.string.app_list_show_no_launcher), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                
+                Spacer(modifier = Modifier.weight(1f))
+
+                if (enableQuickSelectCommonApps) {
+                    Box(
+                        modifier = Modifier
+                            .padding(end = 2.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .clickable {
+                                val matches = if (quickSelectExcludeCommonApps) {
+                                    allApps
+                                        .asSequence()
+                                        .map { it.packageName }
+                                        .filter { pkg -> pkg !in commonMatches }
+                                        .toSet()
+                                } else {
+                                    commonMatches
+                                }
+
+                                tempSelected = tempSelected.toMutableSet().apply {
+                                    addAll(matches)
+                                }
+                            }
+                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.1f))
+                            .padding(horizontal = 12.dp, vertical = 6.dp)
+                    ) {
+                        Text(
+                            text = stringResource(R.string.app_list_quick_select),
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                }
             }
 
             Spacer(modifier = Modifier.height(8.dp))
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(stringResource(R.string.app_list_show_no_launcher), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
-                Switch(
-                    checked = showNoLauncherApps,
-                    onCheckedChange = { showNoLauncherApps = it },
-                    colors = SwitchDefaults.colors(
-                        checkedThumbColor = MaterialTheme.colorScheme.onPrimary,
-                        checkedTrackColor = MaterialTheme.colorScheme.primary,
-                        uncheckedThumbColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                        uncheckedTrackColor = MaterialTheme.colorScheme.outline
-                    )
-                )
-            }
-
-            if (enableQuickSelectCommonApps) {
-                Spacer(modifier = Modifier.height(12.dp))
-
-                Button(
-                    onClick = {
-                        val matches = allApps
-                            .asSequence()
-                            .map { it.packageName }
-                            .filter { pkg ->
-                                pkg in commonExactPackages || commonPrefixPackages.any { prefix -> pkg.startsWith(prefix) }
-                            }
-                            .toSet()
-
-                        tempSelected = tempSelected.toMutableSet().apply {
-                            addAll(matches)
-                        }
-                    },
-                    modifier = Modifier.fillMaxWidth().height(44.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary, contentColor = MaterialTheme.colorScheme.onPrimary),
-                    shape = RoundedCornerShape(22.dp)
-                ) {
-                    Text(stringResource(R.string.app_list_quick_select), fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onPrimary)
-                }
-            }
+            Divider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f))
+            Spacer(modifier = Modifier.height(8.dp))
 
             LazyColumn(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .fillMaxHeight(0.72f)
+                    .weight(1f)
             ) {
                 items(filteredApps, key = { it.packageName }) { app ->
                     val checked = tempSelected.contains(app.packageName)
@@ -470,7 +511,7 @@ fun AppMultiSelectDialog(
                                     if (checked) remove(app.packageName) else add(app.packageName)
                                 }
                             }
-                            .padding(vertical = 10.dp, horizontal = 8.dp),
+                                .padding(vertical = 4.dp, horizontal = 4.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Checkbox(
@@ -526,7 +567,7 @@ fun AppMultiSelectDialog(
                 }
             }
 
-            Spacer(modifier = Modifier.height(16.dp))
+            Spacer(modifier = Modifier.height(12.dp))
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -1004,9 +1045,25 @@ fun NodeFilterDialog(
     onDismiss: () -> Unit
 ) {
     var filterMode by remember { mutableStateOf(currentFilter.filterMode) }
-    var keywordsText by remember {
-        mutableStateOf(currentFilter.keywords.joinToString(", "))
+    var includeKeywordsText by remember {
+        mutableStateOf(
+            if (currentFilter.filterMode == FilterMode.INCLUDE) {
+                currentFilter.keywords.joinToString(", ")
+            } else {
+                ""
+            }
+        )
     }
+    var excludeKeywordsText by remember {
+        mutableStateOf(
+            if (currentFilter.filterMode == FilterMode.EXCLUDE) {
+                currentFilter.keywords.joinToString(", ")
+            } else {
+                ""
+            }
+        )
+    }
+
 
     Dialog(onDismissRequest = onDismiss) {
         Column(
@@ -1110,16 +1167,32 @@ fun NodeFilterDialog(
                 Spacer(modifier = Modifier.height(20.dp))
                 
                 Text(
-                    text = stringResource(R.string.node_filter_keywords),
+                    text = if (filterMode == FilterMode.INCLUDE) {
+                        stringResource(R.string.node_filter_include)
+                    } else {
+                        stringResource(R.string.node_filter_exclude)
+                    },
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 
                 Spacer(modifier = Modifier.height(8.dp))
                 
+                val activeKeywords = if (filterMode == FilterMode.INCLUDE) {
+                    includeKeywordsText
+                } else {
+                    excludeKeywordsText
+                }
+                
                 OutlinedTextField(
-                    value = keywordsText,
-                    onValueChange = { keywordsText = it },
+                    value = activeKeywords,
+                    onValueChange = { newValue ->
+                        if (filterMode == FilterMode.INCLUDE) {
+                            includeKeywordsText = newValue
+                        } else {
+                            excludeKeywordsText = newValue
+                        }
+                    },
                     placeholder = { Text(stringResource(R.string.node_filter_keywords_hint), color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)) },
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = false,
@@ -1144,6 +1217,7 @@ fun NodeFilterDialog(
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
+
             
             Spacer(modifier = Modifier.height(24.dp))
             
@@ -1156,8 +1230,10 @@ fun NodeFilterDialog(
                 TextButton(
                     onClick = {
                         filterMode = FilterMode.NONE
-                        keywordsText = ""
+                        includeKeywordsText = ""
+                        excludeKeywordsText = ""
                     },
+
                     modifier = Modifier.weight(1f).height(50.dp),
                     colors = ButtonDefaults.textButtonColors(contentColor = Destructive)
                 ) {
@@ -1176,15 +1252,21 @@ fun NodeFilterDialog(
                 // 确定按钮
                 Button(
                     onClick = {
+                        val rawKeywords = when (filterMode) {
+                            FilterMode.INCLUDE -> includeKeywordsText
+                            FilterMode.EXCLUDE -> excludeKeywordsText
+                            else -> ""
+                        }
                         val keywords = if (filterMode == FilterMode.NONE) {
                             emptyList()
                         } else {
-                            keywordsText
-                                .split(",", "，") // 支持中英文逗号
+                            rawKeywords
+                                .split(",", "，")
                                 .map { it.trim() }
                                 .filter { it.isNotEmpty() }
                         }
                         onConfirm(NodeFilter(keywords, filterMode))
+
                     },
                     modifier = Modifier.weight(1f).height(50.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary, contentColor = MaterialTheme.colorScheme.onPrimary),
@@ -1194,6 +1276,194 @@ fun NodeFilterDialog(
                         text = stringResource(R.string.common_ok),
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.onPrimary
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun NodeSelectorDialog(
+    title: String,
+    nodes: List<NodeUi>,
+    selectedNodeId: String?,
+    testingNodeIds: Set<String> = emptySet(),
+    onSelect: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    Dialog(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .fillMaxHeight(0.75f)
+                .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(28.dp))
+                .padding(24.dp)
+        ) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onSurface
+            )
+            
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            if (nodes.isEmpty()) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = stringResource(R.string.dashboard_no_nodes_available),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            } else {
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    items(nodes, key = { it.id }) { node ->
+                        val isSelected = node.id == selectedNodeId
+                        val isTesting = testingNodeIds.contains(node.id)
+                        
+                        NodeSelectorItem(
+                            node = node,
+                            isSelected = isSelected,
+                            isTesting = isTesting,
+                            onClick = {
+                                onSelect(node.id)
+                                onDismiss()
+                            }
+                        )
+                    }
+                }
+            }
+            
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            TextButton(
+                onClick = onDismiss,
+                modifier = Modifier.fillMaxWidth().height(50.dp),
+                colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.onSurfaceVariant)
+            ) {
+                Text(stringResource(R.string.common_cancel))
+            }
+        }
+    }
+}
+
+@Composable
+private fun NodeSelectorItem(
+    node: NodeUi,
+    isSelected: Boolean,
+    isTesting: Boolean,
+    onClick: () -> Unit
+) {
+    val borderColor = if (isSelected) MaterialTheme.colorScheme.primary else Color.Transparent
+    val backgroundColor = if (isSelected) {
+        MaterialTheme.colorScheme.primary.copy(alpha = 0.1f)
+    } else {
+        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
+    }
+    
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(backgroundColor, RoundedCornerShape(12.dp))
+            .border(
+                width = if (isSelected) 1.5.dp else 0.dp,
+                color = borderColor,
+                shape = RoundedCornerShape(12.dp)
+            )
+            .clickable(onClick = onClick)
+            .padding(12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            modifier = Modifier.size(20.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            if (isSelected) {
+                Box(
+                    modifier = Modifier
+                        .size(20.dp)
+                        .background(MaterialTheme.colorScheme.primary, androidx.compose.foundation.shape.CircleShape),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = androidx.compose.material.icons.Icons.Rounded.Check,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onPrimary,
+                        modifier = Modifier.size(14.dp)
+                    )
+                }
+            }
+        }
+        
+        Spacer(modifier = Modifier.width(12.dp))
+        
+        Column(modifier = Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (node.regionFlag != null && !node.displayName.contains(node.regionFlag)) {
+                    Text(
+                        text = node.regionFlag,
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.padding(end = 6.dp)
+                    )
+                }
+                Text(
+                    text = node.displayName,
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                    color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
+                    modifier = Modifier.weight(1f, fill = false)
+                )
+            }
+            
+            Spacer(modifier = Modifier.height(2.dp))
+            
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = node.protocolDisplay,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                
+                Spacer(modifier = Modifier.width(8.dp))
+                
+                if (isTesting) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(10.dp),
+                        color = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f),
+                        strokeWidth = 1.5.dp
+                    )
+                } else {
+                    val latency = node.latencyMs
+                    val latencyColor = when {
+                        latency == null -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+                        latency < 0 -> Color.Red
+                        latency < 1000 -> Color(0xFF4CAF50)
+                        latency < 2000 -> Color(0xFFFFC107)
+                        else -> Color.Red
+                    }
+                    val latencyText = when {
+                        latency == null -> "---"
+                        latency < 0 -> "Timeout"
+                        else -> "${latency}ms"
+                    }
+                    Text(
+                        text = latencyText,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = latencyColor,
+                        fontWeight = if (latency != null && latency > 0) FontWeight.Bold else FontWeight.Normal
                     )
                 }
             }

@@ -17,7 +17,7 @@ data class AppSettings(
     
     // TUN/VPN 设置
     @SerializedName("tunEnabled") val tunEnabled: Boolean = true,
-    @SerializedName("tunStack") val tunStack: TunStack = TunStack.SYSTEM,
+    @SerializedName("tunStack") val tunStack: TunStack = TunStack.MIXED,
     @SerializedName("tunMtu") val tunMtu: Int = 1280,  // 与 SettingsRepository 默认值保持一致
     @SerializedName("tunInterfaceName") val tunInterfaceName: String = "tun0",
     @SerializedName("autoRoute") val autoRoute: Boolean = false,
@@ -53,10 +53,14 @@ data class AppSettings(
     @SerializedName("blockQuic") val blockQuic: Boolean = true,
     @SerializedName("debugLoggingEnabled") val debugLoggingEnabled: Boolean = false,
     
+    // 连接重置设置 (参考 NekoBox)
+    @SerializedName("networkChangeResetConnections") val networkChangeResetConnections: Boolean = true,
+    @SerializedName("wakeResetConnections") val wakeResetConnections: Boolean = false,
+    
     // 延迟测试设置
     @SerializedName("latencyTestMethod") val latencyTestMethod: LatencyTestMethod = LatencyTestMethod.REAL_RTT,
-    @SerializedName("latencyTestUrl") val latencyTestUrl: String = "https://cp.cloudflare.com/generate_204",
-    @SerializedName("latencyTestTimeout") val latencyTestTimeout: Int = 2000, // 默认 2000ms
+    @SerializedName("latencyTestUrl") val latencyTestUrl: String = "https://www.google.com/generate_204",
+    @SerializedName("latencyTestTimeout") val latencyTestTimeout: Int = 5000, // 默认 5000ms (参考 v2rayNG/sing-box 的超时设置)
     @SerializedName("latencyTestConcurrency") val latencyTestConcurrency: Int = 10, // 批量测试并发数/每批大小
     
     // 镜像设置
@@ -81,7 +85,12 @@ data class AppSettings(
     @SerializedName("customNodeOrder") val customNodeOrder: List<String> = emptyList(),
 
     // 版本更新设置
-    @SerializedName("autoCheckUpdate") val autoCheckUpdate: Boolean = true
+    @SerializedName("autoCheckUpdate") val autoCheckUpdate: Boolean = true,
+
+    // 自定义配置 JSON
+    @SerializedName("customOutboundsJson") val customOutboundsJson: String = "",
+    @SerializedName("customRouteRulesJson") val customRouteRulesJson: String = "",
+    @SerializedName("customDnsRulesJson") val customDnsRulesJson: String = ""
 )
 
 enum class LatencyTestMethod(@StringRes val displayNameRes: Int) {

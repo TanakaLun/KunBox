@@ -19,6 +19,8 @@ import com.kunk.singbox.model.RoutingMode
 import com.kunk.singbox.model.AppRule
 import com.kunk.singbox.model.AppGroup
 import com.kunk.singbox.model.RuleSet
+import com.kunk.singbox.model.RuleSetOutboundMode
+import com.kunk.singbox.model.RuleSetType
 import com.kunk.singbox.model.TunStack
 import com.kunk.singbox.model.LatencyTestMethod
 import com.kunk.singbox.model.VpnAppMode
@@ -46,6 +48,48 @@ class SettingsRepository(private val context: Context) {
     private fun parseVpnAppMode(raw: String?): VpnAppMode {
         if (raw.isNullOrBlank()) return VpnAppMode.ALL
         return VpnAppMode.entries.firstOrNull { it.name == raw } ?: VpnAppMode.ALL
+    }
+
+    fun getDefaultRuleSets(): List<RuleSet> {
+        val geositeBase = "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set"
+        val geoipBase = "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set"
+        return listOf(
+            RuleSet(
+                tag = "geosite-cn",
+                type = RuleSetType.REMOTE,
+                url = "$geositeBase/geosite-cn.srs",
+                enabled = false,
+                outboundMode = RuleSetOutboundMode.DIRECT
+            ),
+            RuleSet(
+                tag = "geoip-cn",
+                type = RuleSetType.REMOTE,
+                url = "$geoipBase/geoip-cn.srs",
+                enabled = false,
+                outboundMode = RuleSetOutboundMode.DIRECT
+            ),
+            RuleSet(
+                tag = "geosite-geolocation-!cn",
+                type = RuleSetType.REMOTE,
+                url = "$geositeBase/geosite-geolocation-!cn.srs",
+                enabled = false,
+                outboundMode = RuleSetOutboundMode.PROXY
+            ),
+            RuleSet(
+                tag = "geosite-category-ads-all",
+                type = RuleSetType.REMOTE,
+                url = "$geositeBase/geosite-category-ads-all.srs",
+                enabled = false,
+                outboundMode = RuleSetOutboundMode.BLOCK
+            ),
+            RuleSet(
+                tag = "geosite-private",
+                type = RuleSetType.REMOTE,
+                url = "$geositeBase/geosite-private.srs",
+                enabled = false,
+                outboundMode = RuleSetOutboundMode.DIRECT
+            )
+        )
     }
 
     private object PreferencesKeys {
@@ -94,6 +138,10 @@ class SettingsRepository(private val context: Context) {
         val GH_PROXY_MIRROR = stringPreferencesKey("gh_proxy_mirror")
         val DEBUG_LOGGING_ENABLED = booleanPreferencesKey("debug_logging_enabled")
         
+        // 连接重置设置
+        val NETWORK_CHANGE_RESET_CONNECTIONS = booleanPreferencesKey("network_change_reset_connections")
+        val WAKE_RESET_CONNECTIONS = booleanPreferencesKey("wake_reset_connections")
+        
         // 代理设置
         val PROXY_PORT = intPreferencesKey("proxy_port")
         val ALLOW_LAN = booleanPreferencesKey("allow_lan")
@@ -118,6 +166,11 @@ class SettingsRepository(private val context: Context) {
 
         // 版本更新
         val AUTO_CHECK_UPDATE = booleanPreferencesKey("auto_check_update")
+
+        // 自定义配置 JSON
+        val CUSTOM_OUTBOUNDS_JSON = stringPreferencesKey("custom_outbounds_json")
+        val CUSTOM_ROUTE_RULES_JSON = stringPreferencesKey("custom_route_rules_json")
+        val CUSTOM_DNS_RULES_JSON = stringPreferencesKey("custom_dns_rules_json")
     }
     
     val settings: Flow<AppSettings> = context.dataStore.data.map { preferences ->
@@ -337,10 +390,14 @@ class SettingsRepository(private val context: Context) {
             blockQuic = preferences[PreferencesKeys.BLOCK_QUIC] ?: true,
             debugLoggingEnabled = preferences[PreferencesKeys.DEBUG_LOGGING_ENABLED] ?: false,
             latencyTestMethod = LatencyTestMethod.valueOf(preferences[PreferencesKeys.LATENCY_TEST_METHOD] ?: LatencyTestMethod.REAL_RTT.name),
-            latencyTestUrl = preferences[PreferencesKeys.LATENCY_TEST_URL] ?: "https://cp.cloudflare.com/generate_204",
+            latencyTestUrl = preferences[PreferencesKeys.LATENCY_TEST_URL] ?: "https://www.gstatic.com/generate_204",
             latencyTestTimeout = preferences[PreferencesKeys.LATENCY_TEST_TIMEOUT] ?: 2000,
             latencyTestConcurrency = preferences[PreferencesKeys.LATENCY_TEST_CONCURRENCY] ?: 10,
             bypassLan = preferences[PreferencesKeys.BYPASS_LAN] ?: true,
+            
+            // 连接重置设置
+            networkChangeResetConnections = preferences[PreferencesKeys.NETWORK_CHANGE_RESET_CONNECTIONS] ?: true,
+            wakeResetConnections = preferences[PreferencesKeys.WAKE_RESET_CONNECTIONS] ?: false,
             
             // 镜像设置
             ghProxyMirror = selectedMirror,
@@ -369,7 +426,12 @@ class SettingsRepository(private val context: Context) {
             customNodeOrder = customNodeOrder,
 
             // 版本更新设置
-            autoCheckUpdate = preferences[PreferencesKeys.AUTO_CHECK_UPDATE] ?: true
+            autoCheckUpdate = preferences[PreferencesKeys.AUTO_CHECK_UPDATE] ?: true,
+
+            // 自定义配置 JSON
+            customOutboundsJson = preferences[PreferencesKeys.CUSTOM_OUTBOUNDS_JSON] ?: "",
+            customRouteRulesJson = preferences[PreferencesKeys.CUSTOM_ROUTE_RULES_JSON] ?: "",
+            customDnsRulesJson = preferences[PreferencesKeys.CUSTOM_DNS_RULES_JSON] ?: ""
         )
     }.flowOn(Dispatchers.Default)
     
@@ -550,6 +612,14 @@ class SettingsRepository(private val context: Context) {
         notifyRestartRequired()
     }
     
+    suspend fun setNetworkChangeResetConnections(value: Boolean) {
+        context.dataStore.edit { it[PreferencesKeys.NETWORK_CHANGE_RESET_CONNECTIONS] = value }
+    }
+    
+    suspend fun setWakeResetConnections(value: Boolean) {
+        context.dataStore.edit { it[PreferencesKeys.WAKE_RESET_CONNECTIONS] = value }
+    }
+    
     suspend fun setGhProxyMirror(value: GhProxyMirror) {
         context.dataStore.edit { it[PreferencesKeys.GH_PROXY_MIRROR] = value.name }
         notifyRestartRequired()
@@ -612,7 +682,23 @@ class SettingsRepository(private val context: Context) {
     suspend fun setAutoCheckUpdate(value: Boolean) {
         context.dataStore.edit { it[PreferencesKeys.AUTO_CHECK_UPDATE] = value }
     }
-    
+
+    // 自定义配置 JSON
+    suspend fun setCustomOutboundsJson(value: String) {
+        context.dataStore.edit { it[PreferencesKeys.CUSTOM_OUTBOUNDS_JSON] = value }
+        notifyRestartRequired()
+    }
+
+    suspend fun setCustomRouteRulesJson(value: String) {
+        context.dataStore.edit { it[PreferencesKeys.CUSTOM_ROUTE_RULES_JSON] = value }
+        notifyRestartRequired()
+    }
+
+    suspend fun setCustomDnsRulesJson(value: String) {
+        context.dataStore.edit { it[PreferencesKeys.CUSTOM_DNS_RULES_JSON] = value }
+        notifyRestartRequired()
+    }
+
     suspend fun setNodeFilter(value: NodeFilter) {
         context.dataStore.edit { it[PreferencesKeys.NODE_FILTER] = gson.toJson(value) }
     }
@@ -703,7 +789,8 @@ class SettingsRepository(private val context: Context) {
 
             val originalRuleSets = currentSettings.ruleSets
             val currentMirrorUrl = currentSettings.ghProxyMirror.url
-            val migratedRuleSets = originalRuleSets.map { ruleSet ->
+            val targetRuleSets = if (originalRuleSets.isEmpty()) getDefaultRuleSets() else originalRuleSets
+            val migratedRuleSets = targetRuleSets.map { ruleSet ->
                 var updatedUrl = ruleSet.url
                 var updatedTag = ruleSet.tag
                 

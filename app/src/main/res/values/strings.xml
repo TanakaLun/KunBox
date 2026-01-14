@@ -272,6 +272,10 @@
     <!-- Node Detail -->
     <string name="node_detail_title">服务器配置</string>
     <string name="node_detail_saved">配置已保存</string>
+    <string name="node_create_title">创建节点</string>
+    <string name="node_created">节点已创建</string>
+    <string name="nodes_manual_create">手动创建</string>
+    <string name="nodes_select_protocol">选择协议类型</string>
     <string name="node_detail_config_name">配置名称</string>
     <string name="node_detail_server_settings">服务器设置</string>
     <string name="node_detail_server_address">服务器地址</string>
@@ -460,7 +464,7 @@
     <string name="app_list_search_hint">搜索应用或包名</string>
     <string name="app_list_show_system">显示系统应用</string>
     <string name="app_list_show_no_launcher">显示无启动入口应用</string>
-    <string name="app_list_quick_select">一键勾选常用翻墙应用</string>
+    <string name="app_list_quick_select">常见</string>
 
     <!-- QR Scanner -->
     <string name="qr_scanner_no_qr_found">未发现二维码</string>
@@ -471,16 +475,22 @@
     <!-- Profile Card -->
     <string name="profile_card_no_expiry">无限期</string>
     <string name="profile_card_never_updated">从未更新</string>
+    <string name="profile_card_traffic_unlimited">不限量</string>
+    <string name="profile_card_traffic_remaining">剩余:%s</string>
     <string name="profile_card_updated_at">更新:</string>
 
     <!-- Service Notifications -->
     <string name="notification_switch_node">切换节点</string>
     <string name="notification_disconnect">断开</string>
-    <string name="notification_speed_format">↑ %s  ↓ %s</string>
+    <string name="notification_speed_format">↑ %1$s  ↓ %2$s</string>
 
     <!-- Connection Settings -->
     <string name="connection_settings_show_notification_speed">通知栏显示速度</string>
     <string name="connection_settings_show_notification_speed_subtitle">在通知栏实时显示上传和下载速度</string>
+    <string name="connection_settings_network_change_reset">网络变化时重置连接</string>
+    <string name="connection_settings_network_change_reset_subtitle">WiFi/流量切换时关闭所有现有连接，加速网络恢复</string>
+    <string name="connection_settings_wake_reset">唤醒时重置连接</string>
+    <string name="connection_settings_wake_reset_subtitle">设备从休眠唤醒时关闭所有现有连接</string>
 
     <!-- About Dialog -->
     <string name="about_version">应用版本: %1$s (%2$d)</string>
@@ -578,6 +588,20 @@
     <string name="update_status_success_no_changes">更新完成，无变化</string>
     <string name="update_status_partial">更新完成，%1$d个成功，%2$d个失败</string>
     <string name="update_status_complete">更新完成</string>
+
+    <!-- Custom Config -->
+    <string name="custom_config_title">自定义配置</string>
+    <string name="custom_config_subtitle">编辑自定义 JSON 配置</string>
+    <string name="custom_config_view">查看</string>
+    <string name="custom_config_outbounds">Outbounds</string>
+    <string name="custom_config_route_rules">路由规则</string>
+    <string name="custom_config_dns_rules">DNS规则</string>
+    <string name="custom_config_saved">配置已保存</string>
+    <string name="custom_config_invalid_json">JSON 格式无效</string>
+    <string name="custom_config_no_running_config">暂无运行配置，请先启动 VPN</string>
+    <string name="custom_config_outbounds_hint">输入自定义 Outbounds JSON 数组，将合并到生成的配置中</string>
+    <string name="custom_config_route_rules_hint">输入自定义路由规则 JSON 数组，将合并到生成的配置中</string>
+    <string name="custom_config_dns_rules_hint">输入自定义 DNS 规则 JSON 数组，将合并到生成的配置中</string>
 
     <!-- Infinite Date -->
     <string name="date_infinite">无限期</string>

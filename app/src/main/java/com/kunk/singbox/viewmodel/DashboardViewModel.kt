@@ -28,6 +28,7 @@ import com.kunk.singbox.service.SingBoxService
 import com.kunk.singbox.service.ProxyOnlyService
 import com.kunk.singbox.service.VpnTileService
 import com.kunk.singbox.core.SingBoxCore
+import com.kunk.singbox.core.BoxWrapperManager
 import com.kunk.singbox.repository.ConfigRepository
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.Dispatchers
@@ -117,6 +118,9 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun setActiveNode(nodeId: String) {
+        // 2025-fix: 先同步更新 activeNodeId，避免竞态条件
+        configRepository.setActiveNodeIdOnly(nodeId)
+
         viewModelScope.launch {
             val node = nodes.value.find { it.id == nodeId }
             val result = configRepository.setActiveNodeWithResult(nodeId)
@@ -265,7 +269,14 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     // VPN 权限请求结果
     private val _vpnPermissionNeeded = MutableStateFlow(false)
     val vpnPermissionNeeded: StateFlow<Boolean> = _vpnPermissionNeeded.asStateFlow()
-    
+
+    // 2025-fix: 用于确保状态监听只在 IPC 绑定后启动一次
+    @Volatile private var stateCollectorStarted = false
+
+    // 2025-fix: 标记是否在启动时检测到了系统 VPN
+    // 用于过滤 IPC 连接初期的虚假 STOPPED 状态
+    private var systemVpnDetectedOnBoot = false
+
     init {
         viewModelScope.launch {
             settingsRepository.getNodeFilterFlow().collect {
@@ -307,6 +318,12 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                 } else {
                     false
                 }
+
+                // 记录系统 VPN 状态
+                if (hasSystemVpn) {
+                    systemVpnDetectedOnBoot = true
+                }
+
                 val persisted = context.getSharedPreferences("vpn_state", Context.MODE_PRIVATE)
                     .getBoolean("vpn_active", false)
 
@@ -322,25 +339,10 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                     _connectionState.value = ConnectionState.Idle
                 }
             }
-        }
 
-        // Observe SingBoxService running and starting state to keep UI in sync
-        viewModelScope.launch {
-            SingBoxRemote.isRunning.collect { running ->
-                if (running) {
-                    _connectionState.value = ConnectionState.Connected
-                    _connectedAtElapsedMs.value = SystemClock.elapsedRealtime()
-                    startTrafficMonitor()
-                } else if (!SingBoxRemote.isStarting.value) {
-                    _connectionState.value = ConnectionState.Idle
-                    _connectedAtElapsedMs.value = null
-                    stopTrafficMonitor()
-                    stopPingTest()
-                    _statsBase.value = ConnectionStats(0, 0, 0, 0, 0)
-                    // Disconnect resets ping state to "not tested"
-                    _currentNodePing.value = null
-                }
-            }
+            // 2025-fix: IPC 绑定完成后再启动状态监听
+            // 避免在绑定前收到过时的初始值 STOPPED 导致 UI 显示断开
+            startStateCollector()
         }
 
         // Surface service-level startup errors on UI
@@ -358,17 +360,206 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                 }
             }
         }
+    }
 
+    /**
+     * 2025-fix: 启动状态监听器
+     * 确保只在 IPC 绑定完成后调用一次
+     */
+    // 2025-fix: 用于处理连接状态变更的防抖 Job
+    private var pendingIdleJob: Job? = null
+    private var startGraceUntilElapsedMs: Long? = null
+
+    /**
+     * 统一管理连接状态更新，内置防抖逻辑防止 UI 闪烁
+     */
+    private fun setConnectionState(newState: ConnectionState) {
+        if (newState == ConnectionState.Disconnecting && _connectionState.value == ConnectionState.Connecting) {
+            val graceUntil = startGraceUntilElapsedMs
+            if (graceUntil != null && SystemClock.elapsedRealtime() < graceUntil) {
+                return
+            }
+        }
+        when (newState) {
+            ConnectionState.Connected -> {
+                // 如果有挂起的"变更为Idle"的任务，立即取消，说明是虚惊一场
+                pendingIdleJob?.cancel()
+                pendingIdleJob = null
+                startGraceUntilElapsedMs = null
+
+                if (_connectionState.value != ConnectionState.Connected) {
+                    _connectionState.value = ConnectionState.Connected
+                    _connectedAtElapsedMs.value = SystemClock.elapsedRealtime()
+                    startTrafficMonitor()
+                }
+            }
+            ConnectionState.Idle -> {
+                // 如果当前是已连接，不要立即断开，而是延迟执行
+                if (_connectionState.value == ConnectionState.Connected) {
+                    // 如果已经在等待断开，不要重复创建
+                    if (pendingIdleJob?.isActive == true) return
+
+                    pendingIdleJob = viewModelScope.launch {
+                        // 如果是启动时的检测，给更长的宽限期 (1000ms)，否则给普通的防抖期 (300ms)
+                        val delayTime = if (systemVpnDetectedOnBoot) 1000L else 300L
+                        delay(delayTime)
+
+                        // 宽限期过，再次检查 SingBoxRemote 状态
+                        // 只有当服务端依然坚持是 STOPPED 时，才真正断开 UI
+                        if (SingBoxRemote.state.value == SingBoxService.ServiceState.STOPPED) {
+                            performDisconnect()
+                        }
+                        // 宽限期结束，标记失效
+                        systemVpnDetectedOnBoot = false
+                        pendingIdleJob = null
+                    }
+                } else if (_connectionState.value == ConnectionState.Connecting) {
+                    val graceUntil = startGraceUntilElapsedMs
+                    if (graceUntil != null) {
+                        val now = SystemClock.elapsedRealtime()
+                        val remaining = graceUntil - now
+                        if (remaining > 0) {
+                            if (pendingIdleJob?.isActive == true) return
+                            pendingIdleJob = viewModelScope.launch {
+                                delay(remaining)
+                                if (SingBoxRemote.state.value == SingBoxService.ServiceState.STOPPED) {
+                                    performDisconnect()
+                                }
+                                pendingIdleJob = null
+                            }
+                            return
+                        }
+                    }
+                    performDisconnect()
+                } else {
+                    // 当前不是连接状态，直接更新
+                    performDisconnect()
+                }
+            }
+            else -> {
+                // 其他状态（Connecting/Disconnecting/Error）直接更新
+                pendingIdleJob?.cancel()
+                if (newState == ConnectionState.Connecting) {
+                    startGraceUntilElapsedMs = SystemClock.elapsedRealtime() + 800L
+                } else {
+                    startGraceUntilElapsedMs = null
+                }
+                if (_connectionState.value != newState) {
+                    _connectionState.value = newState
+                }
+            }
+        }
+    }
+
+    private fun performDisconnect() {
+        if (_connectionState.value != ConnectionState.Idle) {
+            _connectionState.value = ConnectionState.Idle
+            _connectedAtElapsedMs.value = null
+            stopTrafficMonitor()
+            stopPingTest()
+            _statsBase.value = ConnectionStats(0, 0, 0, 0, 0)
+            _currentNodePing.value = null
+        }
+    }
+
+    private fun startStateCollector() {
+        if (stateCollectorStarted) return
+        stateCollectorStarted = true
+
+        // Observe SingBoxService state to keep UI in sync
         viewModelScope.launch {
-            SingBoxRemote.isStarting.collect { starting ->
-                if (starting) {
-                    _connectionState.value = ConnectionState.Connecting
-                } else if (!SingBoxRemote.isRunning.value) {
-                    if (_connectionState.value != ConnectionState.Connecting) {
-                        _connectionState.value = ConnectionState.Idle
+            SingBoxRemote.state.collect { state ->
+                when (state) {
+                    SingBoxService.ServiceState.RUNNING -> {
+                        systemVpnDetectedOnBoot = false
+                        setConnectionState(ConnectionState.Connected)
+                    }
+                    SingBoxService.ServiceState.STARTING -> {
+                        systemVpnDetectedOnBoot = false
+                        setConnectionState(ConnectionState.Connecting)
+                    }
+                    SingBoxService.ServiceState.STOPPING -> {
+                        systemVpnDetectedOnBoot = false
+                        setConnectionState(ConnectionState.Disconnecting)
+                    }
+                    SingBoxService.ServiceState.STOPPED -> {
+                        setConnectionState(ConnectionState.Idle)
                     }
                 }
             }
+        }
+    }
+
+    /**
+     * 2025-fix: 刷新 VPN 状态
+     * 在 Activity resume 时调用，确保 UI 与服务端状态同步
+     * 解决通过快捷方式操作后返回 App 时 UI 不更新的问题
+     *
+     * 参考 NekoBox 的 SagerConnection 实现：
+     * - 使用 rebind() 强制重新同步状态
+     * - 增加重试机制确保绑定成功
+     */
+    fun refreshState() {
+        viewModelScope.launch {
+            // 2025-fix: 使用 rebind() 强制重新同步状态
+            // rebind() 会检查连接有效性并同步最新状态
+            runCatching { SingBoxRemote.rebind(getApplication()) }
+
+            // 等待 IPC 绑定完成，增加重试次数和间隔
+            var retries = 0
+            while (!SingBoxRemote.isBound() && retries < 20) {
+                delay(100)
+                retries++
+            }
+
+            // 如果绑定成功，状态已经在 rebind() 中同步了
+            // 这里再次读取以确保 UI 更新
+            if (SingBoxRemote.isBound()) {
+                val state = SingBoxRemote.state.value
+                Log.i(TAG, "refreshState: IPC bound, state=$state")
+                when (state) {
+                    SingBoxService.ServiceState.RUNNING -> setConnectionState(ConnectionState.Connected)
+                    SingBoxService.ServiceState.STARTING -> setConnectionState(ConnectionState.Connecting)
+                    SingBoxService.ServiceState.STOPPING -> setConnectionState(ConnectionState.Disconnecting)
+                    SingBoxService.ServiceState.STOPPED -> setConnectionState(ConnectionState.Idle)
+                }
+            } else {
+                // IPC 绑定失败，检查系统 VPN 状态作为后备
+                Log.w(TAG, "refreshState: IPC bind failed, checking system VPN")
+                val context = getApplication<Application>()
+                val hasSystemVpn = checkSystemVpn(context)
+                if (hasSystemVpn) {
+                    // 系统有 VPN，保持当前状态或设为 Connected
+                    if (_connectionState.value == ConnectionState.Idle) {
+                        setConnectionState(ConnectionState.Connected)
+                    }
+                } else {
+                    setConnectionState(ConnectionState.Idle)
+                }
+            }
+
+            // 确保状态监听器已启动
+            startStateCollector()
+        }
+    }
+
+    /**
+     * 检查系统是否有活跃的 VPN 连接
+     */
+    private fun checkSystemVpn(context: Context): Boolean {
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                val cm = context.getSystemService(ConnectivityManager::class.java)
+                cm?.allNetworks?.any { network ->
+                    val caps = cm.getNetworkCapabilities(network) ?: return@any false
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+                } == true
+            } else {
+                false
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to check system VPN", e)
+            false
         }
     }
 
@@ -376,12 +567,21 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             when (_connectionState.value) {
                 ConnectionState.Idle, ConnectionState.Error -> {
+                    // P0 Optimization: Optimistic UI
+                    startGraceUntilElapsedMs = SystemClock.elapsedRealtime() + 800L
+                    _connectionState.value = ConnectionState.Connecting
                     startCore()
                 }
                 ConnectionState.Connecting -> {
+                    // P0 Optimization: Optimistic UI
+                    startGraceUntilElapsedMs = null
+                    _connectionState.value = ConnectionState.Disconnecting
                     stopVpn()
                 }
                 ConnectionState.Connected, ConnectionState.Disconnecting -> {
+                    // P0 Optimization: Optimistic UI
+                    startGraceUntilElapsedMs = null
+                    _connectionState.value = ConnectionState.Disconnecting
                     stopVpn()
                 }
             }
@@ -760,11 +960,11 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     
     private fun startTrafficMonitor() {
         stopTrafficMonitor()
-        
+
         // 重置平滑缓存
         lastUploadSpeed = 0
         lastDownloadSpeed = 0
-        
+
         val uid = Process.myUid()
         val tx0 = TrafficStats.getUidTxBytes(uid).let { if (it > 0) it else 0L }
         val rx0 = TrafficStats.getUidRxBytes(uid).let { if (it > 0) it else 0L }
@@ -774,13 +974,38 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         lastTrafficRxBytes = rx0
         lastTrafficSampleAtElapsedMs = SystemClock.elapsedRealtime()
 
+        // 记录 BoxWrapper 初始流量值 (用于计算本次会话流量)
+        wrapperBaseUpload = BoxWrapperManager.getUploadTotal().let { if (it >= 0) it else 0L }
+        wrapperBaseDownload = BoxWrapperManager.getDownloadTotal().let { if (it >= 0) it else 0L }
+
         trafficSmoothingJob = viewModelScope.launch(Dispatchers.Default) {
             while (true) {
                 delay(1000)
 
                 val nowElapsed = SystemClock.elapsedRealtime()
-                val tx = TrafficStats.getUidTxBytes(uid).let { if (it > 0) it else 0L }
-                val rx = TrafficStats.getUidRxBytes(uid).let { if (it > 0) it else 0L }
+
+                // 双源流量统计: 优先使用 BoxWrapper (内核级), 回退到 TrafficStats (系统级)
+                val (tx, rx, totalTx, totalRx) = if (BoxWrapperManager.isAvailable()) {
+                    // 使用 BoxWrapper 内核级流量统计 (更准确)
+                    val wrapperUp = BoxWrapperManager.getUploadTotal()
+                    val wrapperDown = BoxWrapperManager.getDownloadTotal()
+                    if (wrapperUp >= 0 && wrapperDown >= 0) {
+                        // 计算本次会话流量
+                        val sessionUp = (wrapperUp - wrapperBaseUpload).coerceAtLeast(0L)
+                        val sessionDown = (wrapperDown - wrapperBaseDownload).coerceAtLeast(0L)
+                        Quadruple(wrapperUp, wrapperDown, sessionUp, sessionDown)
+                    } else {
+                        // BoxWrapper 返回无效值，回退到 TrafficStats
+                        val sysTx = TrafficStats.getUidTxBytes(uid).let { if (it > 0) it else 0L }
+                        val sysRx = TrafficStats.getUidRxBytes(uid).let { if (it > 0) it else 0L }
+                        Quadruple(sysTx, sysRx, (sysTx - trafficBaseTxBytes).coerceAtLeast(0L), (sysRx - trafficBaseRxBytes).coerceAtLeast(0L))
+                    }
+                } else {
+                    // BoxWrapper 不可用，使用 TrafficStats
+                    val sysTx = TrafficStats.getUidTxBytes(uid).let { if (it > 0) it else 0L }
+                    val sysRx = TrafficStats.getUidRxBytes(uid).let { if (it > 0) it else 0L }
+                    Quadruple(sysTx, sysRx, (sysTx - trafficBaseTxBytes).coerceAtLeast(0L), (sysRx - trafficBaseRxBytes).coerceAtLeast(0L))
+                }
 
                 val dtMs = (nowElapsed - lastTrafficSampleAtElapsedMs).coerceAtLeast(1L)
                 val dTx = (tx - lastTrafficTxBytes).coerceAtLeast(0L)
@@ -802,9 +1027,6 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                 lastUploadSpeed = smoothedUp
                 lastDownloadSpeed = smoothedDown
 
-                val totalTx = (tx - trafficBaseTxBytes).coerceAtLeast(0L)
-                val totalRx = (rx - trafficBaseRxBytes).coerceAtLeast(0L)
-
                 _statsBase.update { current ->
                     current.copy(
                         uploadSpeed = smoothedUp,
@@ -820,7 +1042,14 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             }
         }
     }
-    
+
+    // 用于双源流量统计的辅助数据类
+    private data class Quadruple(val tx: Long, val rx: Long, val totalTx: Long, val totalRx: Long)
+
+    // BoxWrapper 流量基准值 (用于计算本次会话流量)
+    private var wrapperBaseUpload: Long = 0
+    private var wrapperBaseDownload: Long = 0
+
     private fun stopTrafficMonitor() {
         trafficSmoothingJob?.cancel()
         trafficSmoothingJob = null
@@ -831,6 +1060,8 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         lastTrafficTxBytes = 0
         lastTrafficRxBytes = 0
         lastTrafficSampleAtElapsedMs = 0
+        wrapperBaseUpload = 0
+        wrapperBaseDownload = 0
     }
 
     /**

@@ -40,7 +40,15 @@ class ConfigRepository(private val context: Context) {
     
     companion object {
         private const val TAG = "ConfigRepository"
-        
+
+        /**
+         * 生成稳定的节点 ID（基于 profileId 和 outboundTag 的 UUID）
+         */
+        fun stableNodeId(profileId: String, outboundTag: String): String {
+            val key = "$profileId|$outboundTag"
+            return java.util.UUID.nameUUIDFromBytes(key.toByteArray(Charsets.UTF_8)).toString()
+        }
+
         // User-Agent 列表，按优先级排序
         private val USER_AGENTS = listOf(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", // Browser - 优先尝试获取通用 Base64 订阅，以绕过服务端的客户端过滤
@@ -439,6 +447,20 @@ class ConfigRepository(private val context: Context) {
         }
     }
 
+    private fun parseExpireValue(raw: String): Long {
+        val normalized = raw.trim().trim('"', '\'')
+        if (normalized.isBlank()) return 0L
+        val lower = normalized.lowercase()
+        if (lower.contains("长期") || lower.contains("永久") || lower.contains("无限") || lower.contains("never")) {
+            return -1L
+        }
+        return if (normalized.contains("-")) {
+            parseDateString(normalized)
+        } else {
+            normalized.toLongOrNull() ?: 0L
+        }
+    }
+
     /**
      * 解析 Subscription-Userinfo 头或 Body 中的状态信息
      * 支持标准 Header 格式和常见的 Body 文本格式 (如 STATUS=...)
@@ -449,23 +471,61 @@ class ConfigRepository(private val context: Context) {
         var total = 0L
         var expire = 0L
         var found = false
+        var totalSpecified = false
+
+        fun isUnlimitedValue(raw: String): Boolean {
+            val normalized = raw.trim().lowercase()
+            return normalized == "unlimited" || normalized == "infinite" || normalized == "infinity" || normalized == "inf" || normalized == "∞"
+        }
+
+        fun parseTrafficValue(raw: String): Long {
+            val normalized = raw.trim().trim('"', '\'')
+            return normalized.toLongOrNull() ?: parseTrafficString(normalized)
+        }
+
+
+        fun applyKeyValue(key: String, rawValue: String) {
+            when (key.lowercase()) {
+                "upload" -> {
+                    upload = parseTrafficValue(rawValue)
+                    found = true
+                }
+                "download" -> {
+                    download = parseTrafficValue(rawValue)
+                    found = true
+                }
+                "total" -> {
+                    totalSpecified = true
+                    total = if (isUnlimitedValue(rawValue)) -1L else parseTrafficValue(rawValue)
+                    found = true
+                }
+                "expire" -> {
+                    expire = parseExpireValue(rawValue)
+                    found = true
+                }
+            }
+        }
+
+        fun parseKeyValuePairs(text: String) {
+            val kvRegex = Regex("(?i)\\b(upload|download|total|expire)\\b\\s*[:=]\\s*\"?([^,;\\s\\n\\r}]+)\"?")
+            kvRegex.findAll(text).forEach { match ->
+                applyKeyValue(match.groupValues[1], match.groupValues[2])
+            }
+        }
+
+        fun parseHeaderLike(text: String) {
+            text.split(",", ";").forEach { part ->
+                val kv = part.trim().split("=", ":", limit = 2)
+                if (kv.size == 2) {
+                    applyKeyValue(kv[0].trim(), kv[1].trim())
+                }
+            }
+        }
 
         // 1. 尝试解析 Header
         if (!header.isNullOrBlank()) {
             try {
-                header.split(";").forEach { part ->
-                    val kv = part.trim().split("=")
-                    if (kv.size == 2) {
-                        val key = kv[0].trim().lowercase()
-                        val value = kv[1].trim().toLongOrNull() ?: 0L
-                        when (key) {
-                            "upload" -> { upload = value; found = true }
-                            "download" -> { download = value; found = true }
-                            "total" -> { total = value; found = true }
-                            "expire" -> { expire = value; found = true }
-                        }
-                    }
-                }
+                parseHeaderLike(header)
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to parse Subscription-Userinfo header: $header", e)
             }
@@ -475,11 +535,24 @@ class ConfigRepository(private val context: Context) {
         // 格式示例: STATUS=🚀:0.12GB,🚀:37.95GB,TOT:100GB🗓Expires:2026-01-02
         if (bodyDecoded != null && (!found || total == 0L)) {
             try {
+                val userInfoIndex = bodyDecoded.indexOf("subscription-userinfo", ignoreCase = true)
+                val userInfoAltIndex = if (userInfoIndex >= 0) userInfoIndex else bodyDecoded.indexOf("subscription_userinfo", ignoreCase = true)
+                if (userInfoAltIndex >= 0) {
+                    val endIndex = (userInfoAltIndex + 800).coerceAtMost(bodyDecoded.length)
+                    val snippet = bodyDecoded.substring(userInfoAltIndex, endIndex)
+                    val inlineMatch = Regex("(?i)subscription[-_]userinfo\\s*[:=]\\s*\"?([^\"\\n\\r]+)\"?").find(snippet)
+                    if (inlineMatch != null) {
+                        parseHeaderLike(inlineMatch.groupValues[1])
+                    }
+                    parseKeyValuePairs(snippet)
+                }
+
                 val firstLine = bodyDecoded.lines().firstOrNull()?.trim()
                 if (firstLine != null && (firstLine.startsWith("STATUS=") || firstLine.contains("TOT:") || firstLine.contains("Expires:"))) {
                     // 解析 TOT:
                     val totalMatch = Regex("TOT:([\\d.]+[KMGTPE]?)B?").find(firstLine)
                     if (totalMatch != null) {
+                        totalSpecified = true
                         total = parseTrafficString(totalMatch.groupValues[1])
                         found = true
                     }
@@ -504,7 +577,7 @@ class ConfigRepository(private val context: Context) {
                     parts.forEach { part ->
                         if (part.contains("TOT:")) return@forEach
                         if (part.contains("Expires:")) return@forEach
-                        
+
                         // 提取流量值
                         val match = Regex("([\\d.]+[KMGTPE]?)B?").find(part)
                         if (match != null) {
@@ -512,7 +585,7 @@ class ConfigRepository(private val context: Context) {
                             found = true
                         }
                     }
-                    
+
                     if (usedAccumulator > 0) {
                         // 我们不知道哪个是 up 哪个是 down，暂且全部算作 download，或者平分
                         download = usedAccumulator
@@ -525,7 +598,54 @@ class ConfigRepository(private val context: Context) {
         }
 
         if (!found) return null
+        if (totalSpecified && total <= 0L) {
+            total = -1L
+        }
         return SubscriptionUserInfo(upload, download, total, expire)
+    }
+
+    private fun parseUserInfoFromOutbounds(outbounds: List<Outbound>?): SubscriptionUserInfo? {
+        if (outbounds.isNullOrEmpty()) return null
+        var remainingBytes: Long? = null
+        var expireValue: Long? = null
+
+        val remainingRegex = Regex("(?i)(剩余流量|流量剩余|remaining|balance)\\s*[:：]?\\s*([\\d.]+\\s*[KMGTPE]?)\\s*B?")
+        val expireRegex = Regex("(?i)(套餐到期|到期|expiry|expire)\\s*[:：]?\\s*([^\\s,;]+)")
+
+        outbounds.forEach { outbound ->
+            val tag = outbound.tag
+            if (remainingBytes == null) {
+                val match = remainingRegex.find(tag)
+                if (match != null) {
+                    remainingBytes = parseTrafficString(match.groupValues[2])
+                }
+            }
+            if (expireValue == null) {
+                val match = expireRegex.find(tag)
+                if (match != null) {
+                    expireValue = parseExpireValue(match.groupValues[2])
+                }
+            }
+        }
+
+        if (remainingBytes == null && expireValue == null) return null
+        return SubscriptionUserInfo(
+            upload = 0,
+            download = remainingBytes ?: 0,
+            total = if (remainingBytes != null) -2L else 0L,
+            expire = expireValue ?: 0L
+        )
+    }
+
+    private fun mergeUserInfo(primary: SubscriptionUserInfo?, fallback: SubscriptionUserInfo?): SubscriptionUserInfo? {
+        if (primary == null) return fallback
+        if (fallback == null) return primary
+        return SubscriptionUserInfo(
+            upload = if (primary.upload > 0) primary.upload else fallback.upload,
+            download = if (primary.download > 0) primary.download else fallback.download,
+            total = if (primary.total != 0L) primary.total else fallback.total,
+            expire = if (primary.expire != 0L) primary.expire else fallback.expire
+        )
     }
 
     /**
@@ -597,7 +717,8 @@ class ConfigRepository(private val context: Context) {
 
                 if (parsedConfig != null) {
                     Log.i(TAG, "Successfully parsed subscription with UA '$userAgent', got ${parsedConfig!!.outbounds?.size ?: 0} outbounds")
-                    return FetchResult(parsedConfig!!, userInfo)
+                    val mergedUserInfo = mergeUserInfo(userInfo, parseUserInfoFromOutbounds(parsedConfig!!.outbounds))
+                    return FetchResult(parsedConfig!!, mergedUserInfo)
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "Error with UA '$userAgent': ${e.message}")
@@ -1124,11 +1245,16 @@ class ConfigRepository(private val context: Context) {
                     }
                     headers["User-Agent"] = userAgent
 
+                    val rawPath = json.path ?: "/"
+                    val edMatch = Regex("""[?&]ed=(\d+)""").find(rawPath)
+                    val maxEarlyData = edMatch?.groupValues?.get(1)?.toIntOrNull() ?: 2048
+                    val cleanPath = rawPath.replace(Regex("""[?&]ed=\d+"""), "").ifEmpty { "/" }
+
                     TransportConfig(
                         type = "ws",
-                        path = json.path ?: "/",
+                        path = cleanPath,
                         headers = headers,
-                        maxEarlyData = 2048,
+                        maxEarlyData = maxEarlyData,
                         earlyDataHeaderName = "Sec-WebSocket-Protocol"
                     )
                 }
@@ -1161,7 +1287,7 @@ class ConfigRepository(private val context: Context) {
                 security = json.scy ?: "auto",
                 tls = tlsConfig,
                 transport = transport,
-                packetEncoding = json.packetEncoding ?: "xudp"
+                packetEncoding = json.packetEncoding?.takeIf { it.isNotBlank() }
             )
         } catch (e: Exception) {
             e.printStackTrace()
@@ -1313,8 +1439,41 @@ class ConfigRepository(private val context: Context) {
             
             val sni = params["sni"] ?: server
             val insecure = params["allowInsecure"] == "1" || params["insecure"] == "1"
-            val alpnList = params["alpn"]?.split(",")?.filter { it.isNotBlank() }
             val fingerprint = params["fp"]
+            val transportType = params["type"] ?: "tcp"
+            
+            val alpnList = params["alpn"]?.split(",")?.filter { it.isNotBlank() }
+            val finalAlpnList = if (transportType == "ws" && alpnList.isNullOrEmpty()) {
+                listOf("http/1.1")
+            } else {
+                alpnList
+            }
+            
+            val transport = when (transportType) {
+                "ws" -> {
+                    val wsHost = params["host"] ?: sni
+                    val rawPath = params["path"] ?: "/"
+                    val edMatch = Regex("""[?&]ed=(\d+)""").find(rawPath)
+                    val maxEarlyData = params["ed"]?.toIntOrNull() ?: edMatch?.groupValues?.get(1)?.toIntOrNull() ?: 2048
+                    val cleanPath = rawPath.replace(Regex("""[?&]ed=\d+"""), "").ifEmpty { "/" }
+                    
+                    val ua = if (fingerprint?.contains("chrome", true) == true) {
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+                    } else {
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0"
+                    }
+                    
+                    TransportConfig(
+                        type = "ws",
+                        path = cleanPath,
+                        headers = mapOf("Host" to wsHost, "User-Agent" to ua),
+                        maxEarlyData = maxEarlyData,
+                        earlyDataHeaderName = "Sec-WebSocket-Protocol"
+                    )
+                }
+                "grpc" -> TransportConfig(type = "grpc", serviceName = params["serviceName"] ?: "")
+                else -> null
+            }
             
             return Outbound(
                 type = "trojan",
@@ -1326,9 +1485,10 @@ class ConfigRepository(private val context: Context) {
                     enabled = true,
                     serverName = sni,
                     insecure = insecure,
-                    alpn = alpnList,
+                    alpn = finalAlpnList,
                     utls = fingerprint?.let { UtlsConfig(enabled = true, fingerprint = it) }
-                )
+                ),
+                transport = transport
             )
         } catch (e: Exception) {
             Log.e(TAG, "Failed to parse trojan link", e)
@@ -1541,11 +1701,6 @@ class ConfigRepository(private val context: Context) {
         val outbounds = config.outbounds ?: return nodes
         val trafficRepo = TrafficRepository.getInstance(context)
 
-        fun stableNodeId(profileId: String, outboundTag: String): String {
-            val key = "$profileId|$outboundTag"
-            return UUID.nameUUIDFromBytes(key.toByteArray(Charsets.UTF_8)).toString()
-        }
-        
         // 收集所有 selector 和 urltest 的 outbounds 作为分组
         val groupOutbounds = outbounds.filter { 
             it.type == "selector" || it.type == "urltest" 
@@ -1766,6 +1921,11 @@ class ConfigRepository(private val context: Context) {
         object Success : NodeSwitchResult()
         object NotRunning : NodeSwitchResult()
         data class Failed(val reason: String) : NodeSwitchResult()
+    }
+
+    fun setActiveNodeIdOnly(nodeId: String) {
+        _activeNodeId.value = nodeId
+        saveProfiles()
     }
 
     suspend fun setActiveNode(nodeId: String): Boolean {
@@ -2331,6 +2491,11 @@ class ConfigRepository(private val context: Context) {
             val outboundsContext = buildRunOutbounds(config, activeNode, settings, allNodesSnapshot)
             val route = buildRunRoute(settings, outboundsContext.selectorTag, outboundsContext.outbounds, outboundsContext.nodeTagResolver, customRuleSets)
 
+            // 合并自定义配置
+            val mergedOutbounds = mergeCustomOutbounds(outboundsContext.outbounds, settings.customOutboundsJson)
+            val mergedRoute = mergeCustomRouteRules(route, settings.customRouteRulesJson)
+            val mergedDns = mergeCustomDnsRules(dns, settings.customDnsRulesJson)
+
             lastTagToNodeName = outboundsContext.nodeTagMap.mapNotNull { (nodeId, tag) ->
                 val name = allNodesSnapshot.firstOrNull { it.id == nodeId }?.name
                 if (name.isNullOrBlank() || tag.isBlank()) null else (tag to name)
@@ -2340,9 +2505,9 @@ class ConfigRepository(private val context: Context) {
                 log = log,
                 experimental = experimental,
                 inbounds = inbounds,
-                dns = dns,
-                route = route,
-                outbounds = outboundsContext.outbounds
+                dns = mergedDns,
+                route = mergedRoute,
+                outbounds = mergedOutbounds
             )
 
             val validation = singBoxCore.validateConfig(runConfig)
@@ -2405,8 +2570,15 @@ class ConfigRepository(private val context: Context) {
 
         // Fix flow
         val cleanedFlow = result.flow?.takeIf { it.isNotBlank() }
-        if (cleanedFlow != result.flow) {
-            result = result.copy(flow = cleanedFlow)
+        val normalizedFlow = cleanedFlow?.let { flowValue ->
+            if (flowValue.contains("xtls-rprx-vision")) {
+                "xtls-rprx-vision"
+            } else {
+                flowValue
+            }
+        }
+        if (normalizedFlow != result.flow) {
+            result = result.copy(flow = normalizedFlow)
         }
 
         // Fix URLTest - Convert to selector to avoid sing-box core panic during InterfaceUpdated
@@ -3050,8 +3222,79 @@ class ConfigRepository(private val context: Context) {
                 
             }
         }
-        
+
         return rules
+    }
+
+    /**
+     * 合并自定义 Outbounds JSON
+     */
+    private fun mergeCustomOutbounds(outbounds: List<Outbound>, customJson: String): List<Outbound> {
+        if (customJson.isBlank()) return outbounds
+        return try {
+            val customOutbounds = gson.fromJson<List<Outbound>>(
+                customJson,
+                object : com.google.gson.reflect.TypeToken<List<Outbound>>() {}.type
+            ) ?: emptyList()
+            if (customOutbounds.isEmpty()) {
+                outbounds
+            } else {
+                // 自定义 outbounds 添加到列表末尾，但在 direct/block/dns-out 之前
+                val systemTags = setOf("direct", "block", "dns-out")
+                val userOutbounds = outbounds.filter { it.tag !in systemTags }
+                val systemOutbounds = outbounds.filter { it.tag in systemTags }
+                userOutbounds + customOutbounds + systemOutbounds
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to parse custom outbounds JSON: ${e.message}")
+            outbounds
+        }
+    }
+
+    /**
+     * 合并自定义路由规则 JSON
+     */
+    private fun mergeCustomRouteRules(route: RouteConfig, customJson: String): RouteConfig {
+        if (customJson.isBlank()) return route
+        return try {
+            val customRules = gson.fromJson<List<RouteRule>>(
+                customJson,
+                object : com.google.gson.reflect.TypeToken<List<RouteRule>>() {}.type
+            ) ?: emptyList()
+            if (customRules.isEmpty()) {
+                route
+            } else {
+                // 自定义规则添加到规则列表开头（优先级最高）
+                val existingRules = route.rules ?: emptyList()
+                route.copy(rules = customRules + existingRules)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to parse custom route rules JSON: ${e.message}")
+            route
+        }
+    }
+
+    /**
+     * 合并自定义 DNS 规则 JSON
+     */
+    private fun mergeCustomDnsRules(dns: DnsConfig, customJson: String): DnsConfig {
+        if (customJson.isBlank()) return dns
+        return try {
+            val customRules = gson.fromJson<List<DnsRule>>(
+                customJson,
+                object : com.google.gson.reflect.TypeToken<List<DnsRule>>() {}.type
+            ) ?: emptyList()
+            if (customRules.isEmpty()) {
+                dns
+            } else {
+                // 自定义规则添加到规则列表开头（优先级最高）
+                val existingRules = dns.rules ?: emptyList()
+                dns.copy(rules = customRules + existingRules)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to parse custom DNS rules JSON: ${e.message}")
+            dns
+        }
     }
 
     private fun buildRunLogConfig(): LogConfig {
@@ -3109,7 +3352,7 @@ class ConfigRepository(private val context: Context) {
                     type = "tun",
                     tag = "tun-in",
                     interfaceName = settings.tunInterfaceName,
-                    inet4Address = listOf("172.19.0.1/30"),
+                    inet4AddressRaw = listOf("172.19.0.1/30"),
                     mtu = settings.tunMtu,
                     autoRoute = false, // Handled by Android VpnService
                     strictRoute = false, // Can cause issues on some Android versions
@@ -3838,6 +4081,101 @@ class ConfigRepository(private val context: Context) {
     /**
      * 删除节点
      */
+    /**
+     * 手动创建节点（从空白 Outbound 创建）
+     * 复用 addSingleNode 的逻辑，但直接接收 Outbound 对象
+     */
+    fun createNode(outbound: Outbound) {
+        try {
+            // 1. 查找或创建"手动添加"配置
+            val manualProfileName = "Manual"
+            var manualProfile = _profiles.value.find { it.name == manualProfileName && it.type == ProfileType.Imported }
+            val profileId: String
+            val existingConfig: SingBoxConfig?
+
+            if (manualProfile != null) {
+                profileId = manualProfile.id
+                existingConfig = loadConfig(profileId)
+            } else {
+                profileId = UUID.randomUUID().toString()
+                existingConfig = null
+            }
+
+            // 2. 合并或创建 outbounds
+            val newOutbounds = mutableListOf<Outbound>()
+            existingConfig?.outbounds?.let { existing ->
+                newOutbounds.addAll(existing.filter { it.type !in listOf("direct", "block", "dns") })
+            }
+
+            // 检查是否有同名节点，如有则添加后缀
+            var finalTag = outbound.tag
+            var counter = 1
+            while (newOutbounds.any { it.tag == finalTag }) {
+                finalTag = "${outbound.tag}_$counter"
+                counter++
+            }
+            val finalOutbound = if (finalTag != outbound.tag) outbound.copy(tag = finalTag) else outbound
+            newOutbounds.add(finalOutbound)
+
+            // 添加系统 outbounds
+            if (newOutbounds.none { it.tag == "direct" }) {
+                newOutbounds.add(Outbound(type = "direct", tag = "direct"))
+            }
+            if (newOutbounds.none { it.tag == "block" }) {
+                newOutbounds.add(Outbound(type = "block", tag = "block"))
+            }
+            if (newOutbounds.none { it.tag == "dns-out" }) {
+                newOutbounds.add(Outbound(type = "dns", tag = "dns-out"))
+            }
+
+            val newConfig = deduplicateTags(SingBoxConfig(outbounds = newOutbounds))
+
+            // 3. 保存配置文件
+            val configFile = File(configDir, "$profileId.json")
+            configFile.writeText(gson.toJson(newConfig))
+
+            // 4. 更新内存状态
+            cacheConfig(profileId, newConfig)
+            val nodes = extractNodesFromConfig(newConfig, profileId)
+            profileNodes[profileId] = nodes
+
+            // 5. 如果是新配置，添加到 profiles 列表
+            if (manualProfile == null) {
+                manualProfile = ProfileUi(
+                    id = profileId,
+                    name = manualProfileName,
+                    type = ProfileType.Imported,
+                    url = null,
+                    lastUpdated = System.currentTimeMillis(),
+                    enabled = true,
+                    updateStatus = UpdateStatus.Idle
+                )
+                _profiles.update { it + manualProfile }
+            } else {
+                _profiles.update { list ->
+                    list.map { if (it.id == profileId) it.copy(lastUpdated = System.currentTimeMillis()) else it }
+                }
+            }
+
+            // 6. 更新全局节点状态
+            updateAllNodesAndGroups()
+
+            // 7. 激活配置并选中新节点
+            setActiveProfile(profileId)
+            val addedNode = nodes.find { it.name == finalTag }
+            if (addedNode != null) {
+                _activeNodeId.value = addedNode.id
+            }
+
+            // 8. 保存配置
+            saveProfiles()
+
+            Log.i(TAG, "Created node: $finalTag in profile $profileId")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to create node", e)
+        }
+    }
+
     fun deleteNode(nodeId: String) {
         val node = _nodes.value.find { it.id == nodeId } ?: return
         val profileId = node.sourceProfileId
@@ -4006,9 +4344,19 @@ class ConfigRepository(private val context: Context) {
         // 更新内存中的配置
         cacheConfig(profileId, newConfig)
         
+        val oldNodes = profileNodes[profileId] ?: _nodes.value
+        val latencyById = oldNodes.associate { it.id to it.latencyMs }
+        val updatedNodeId = stableNodeId(profileId, newName)
+        val originalLatency = oldNodes.find { it.id == nodeId }?.latencyMs
+
         // 重新提取节点列表
         val newNodes = extractNodesFromConfig(newConfig, profileId)
-        profileNodes[profileId] = newNodes
+        val mergedNodes = newNodes.map { nodeItem ->
+            val storedLatency = latencyById[nodeItem.id]
+                ?: if (nodeItem.id == updatedNodeId) originalLatency else null
+            if (storedLatency != null) nodeItem.copy(latencyMs = storedLatency) else nodeItem
+        }
+        profileNodes[profileId] = mergedNodes
         updateAllNodesAndGroups()
 
         // 保存文件
@@ -4021,12 +4369,12 @@ class ConfigRepository(private val context: Context) {
 
         // 如果是当前活跃配置，更新UI状态
         if (_activeProfileId.value == profileId) {
-            _nodes.value = newNodes
-            updateNodeGroups(newNodes)
+            _nodes.value = mergedNodes
+            updateNodeGroups(mergedNodes)
             
             // 如果重命名的是当前选中节点，更新 activeNodeId
             if (_activeNodeId.value == nodeId) {
-                val newNode = newNodes.find { it.name == newName }
+                val newNode = mergedNodes.find { it.name == newName }
                 if (newNode != null) {
                     _activeNodeId.value = newNode.id
                 }
@@ -4055,9 +4403,19 @@ class ConfigRepository(private val context: Context) {
         // 更新内存中的配置
         cacheConfig(profileId, newConfig)
         
+        val oldNodes = profileNodes[profileId] ?: _nodes.value
+        val latencyById = oldNodes.associate { it.id to it.latencyMs }
+        val updatedNodeId = stableNodeId(profileId, newOutbound.tag)
+        val originalLatency = oldNodes.find { it.id == nodeId }?.latencyMs
+
         // 重新提取节点列表
         val newNodes = extractNodesFromConfig(newConfig, profileId)
-        profileNodes[profileId] = newNodes
+        val mergedNodes = newNodes.map { nodeItem ->
+            val storedLatency = latencyById[nodeItem.id]
+                ?: if (nodeItem.id == updatedNodeId) originalLatency else null
+            if (storedLatency != null) nodeItem.copy(latencyMs = storedLatency) else nodeItem
+        }
+        profileNodes[profileId] = mergedNodes
         updateAllNodesAndGroups()
 
         // 保存文件
@@ -4070,12 +4428,12 @@ class ConfigRepository(private val context: Context) {
 
         // 如果是当前活跃配置，更新UI状态
         if (_activeProfileId.value == profileId) {
-            _nodes.value = newNodes
-            updateNodeGroups(newNodes)
+            _nodes.value = mergedNodes
+            updateNodeGroups(mergedNodes)
             
             // 如果更新的是当前选中节点，尝试恢复选中状态
             if (_activeNodeId.value == nodeId) {
-                val newNode = newNodes.find { it.name == newOutbound.tag }
+                val newNode = mergedNodes.find { it.name == newOutbound.tag }
                 if (newNode != null) {
                     _activeNodeId.value = newNode.id
                 }

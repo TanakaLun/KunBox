@@ -38,6 +38,7 @@ docs/mcp-setup/
 # 临时文件和调试文件
 temp_fix.txt
 planning-with-files/
+.worktrees/
 
 # 备份文件
 *.backup
@@ -50,3 +51,4 @@ planning-with-files/
 # 构建脚本临时文件
 buildScript/tasks/*.py
 buildScript/tasks/remove_*.ps1
+buildScript/singbox-build/box_ext.go
