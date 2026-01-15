@@ -35,6 +35,7 @@ import java.net.Socket
 import java.util.concurrent.TimeUnit
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import com.kunk.singbox.utils.PreciseLatencyTester
 import java.lang.reflect.Modifier
 import java.lang.reflect.Method
 import java.util.Collections
@@ -146,17 +147,21 @@ class SingBoxCore private constructor(private val context: Context) {
      * 使用 Libbox 原生方法进行延迟测试
      * 优先尝试调用 NekoBox 内核的 urlTest 方法，失败则回退到本地 HTTP 代理测速
      */
-    private suspend fun testOutboundLatencyWithLibbox(outbound: Outbound, settings: com.kunk.singbox.model.AppSettings? = null): Long = withContext(Dispatchers.IO) {
+    private suspend fun testOutboundLatencyWithLibbox(
+        outbound: Outbound,
+        settings: com.kunk.singbox.model.AppSettings? = null,
+        dependencyOutbounds: List<Outbound> = emptyList()
+    ): Long = withContext(Dispatchers.IO) {
         if (!libboxAvailable) return@withContext -1L
-        
+
         val finalSettings = settings ?: SettingsRepository.getInstance(context).settings.first()
         val url = adjustUrlForMode(finalSettings.latencyTestUrl, finalSettings.latencyTestMethod)
         val timeoutMs = finalSettings.latencyTestTimeout
-        
+
         // 尝试使用 NekoBox 原生 urlTest
         // Remove mutex to allow concurrent testing
         val nativeRtt = testWithLibboxStaticUrlTest(outbound, url, timeoutMs, finalSettings.latencyTestMethod)
-        
+
         if (nativeRtt >= 0) {
             return@withContext nativeRtt
         }
@@ -170,7 +175,7 @@ class SingBoxCore private constructor(private val context: Context) {
                     adjustUrlForMode("https://www.gstatic.com/generate_204", finalSettings.latencyTestMethod)
                 }
             } catch (_: Exception) { url }
-            testWithLocalHttpProxy(outbound, url, fallbackUrl, timeoutMs)
+            testWithLocalHttpProxy(outbound, url, fallbackUrl, timeoutMs, dependencyOutbounds)
         } catch (e: Exception) {
             Log.w(TAG, "Native HTTP proxy test failed: ${e.message}")
             -1L
@@ -180,6 +185,37 @@ class SingBoxCore private constructor(private val context: Context) {
     // private var discoveredUrlTestMethod: java.lang.reflect.Method? = null
     // private var discoveredMethodType: Int = 0 // 0: long, 1: URLTest object
     
+    /**
+     * 解析 outbound 的依赖 outbounds
+     * 例如 SS + ShadowTLS 节点，SS 的 detour 字段指向 shadowtls outbound
+     * @param outbound 主节点
+     * @param allOutbounds 完整的 outbound 列表（包含所有潜在依赖）
+     * @return 依赖的 outbound 列表（不包含主节点本身）
+     */
+    private fun resolveDependencyOutbounds(
+        outbound: Outbound,
+        allOutbounds: List<Outbound>
+    ): List<Outbound> {
+        val dependencies = mutableListOf<Outbound>()
+        val visited = mutableSetOf<String>()
+
+        fun resolve(current: Outbound) {
+            val detourTag = current.detour
+            if (detourTag.isNullOrBlank() || visited.contains(detourTag)) return
+            visited.add(detourTag)
+
+            val detourOutbound = allOutbounds.find { it.tag == detourTag }
+            if (detourOutbound != null) {
+                dependencies.add(detourOutbound)
+                // 递归解析依赖的依赖
+                resolve(detourOutbound)
+            }
+        }
+
+        resolve(outbound)
+        return dependencies
+    }
+
     private fun adjustUrlForMode(original: String, method: LatencyTestMethod): String {
         return try {
             val u = URI(original)
@@ -201,16 +237,28 @@ class SingBoxCore private constructor(private val context: Context) {
     
     // Removed reflection helpers: extractDelayFromUrlTest, hasDelayAccessors, buildUrlTestArgs
 
-    private suspend fun testWithLocalHttpProxy(outbound: Outbound, targetUrl: String, fallbackUrl: String? = null, timeoutMs: Int): Long = withContext(Dispatchers.IO) {
+    private suspend fun testWithLocalHttpProxy(
+        outbound: Outbound,
+        targetUrl: String,
+        fallbackUrl: String? = null,
+        timeoutMs: Int,
+        dependencyOutbounds: List<Outbound> = emptyList()
+    ): Long = withContext(Dispatchers.IO) {
         // 优化: 使用 Semaphore 替代 Mutex,允许有限并发
         // 原因: 虽然每个测试都启动临时 service,但通过限制并发数(3个)
         //       可以在保证稳定性的同时,显著提升批量测试性能
         httpProxySemaphore.withPermit {
-            testWithLocalHttpProxyInternal(outbound, targetUrl, fallbackUrl, timeoutMs)
+            testWithLocalHttpProxyInternal(outbound, targetUrl, fallbackUrl, timeoutMs, dependencyOutbounds)
         }
     }
 
-    private suspend fun testWithLocalHttpProxyInternal(outbound: Outbound, targetUrl: String, fallbackUrl: String? = null, timeoutMs: Int): Long {
+    private suspend fun testWithLocalHttpProxyInternal(
+        outbound: Outbound,
+        targetUrl: String,
+        fallbackUrl: String? = null,
+        timeoutMs: Int,
+        dependencyOutbounds: List<Outbound> = emptyList()
+    ): Long {
         val port = allocateLocalPort()
         val inbound = com.kunk.singbox.model.Inbound(
             type = "mixed",
@@ -243,6 +291,11 @@ class SingBoxCore private constructor(private val context: Context) {
         return try {
             val direct = com.kunk.singbox.model.Outbound(type = "direct", tag = "direct")
 
+            // 构建 outbound 列表，包含主节点和依赖的辅助节点（如 shadowtls）
+            val allOutbounds = mutableListOf(outbound)
+            allOutbounds.addAll(dependencyOutbounds)
+            allOutbounds.add(direct)
+
             // 为测试服务生成唯一的临时数据库路径,避免与 VPN 服务的数据库冲突
             // 使用 UUID 确保绝对唯一性,防止高并发时时间戳重复导致路径冲突
             val testDbPath = File(tempDir, "test_${UUID.randomUUID()}.db").absolutePath
@@ -271,7 +324,7 @@ class SingBoxCore private constructor(private val context: Context) {
                     strategy = "ipv4_only"       // 全局 DNS 策略
                 ),
                 inbounds = listOf(inbound),
-                outbounds = listOf(outbound, direct),
+                outbounds = allOutbounds,
                 route = com.kunk.singbox.model.RouteConfig(
                     rules = listOf(
                         com.kunk.singbox.model.RouteRule(protocolRaw = listOf("dns"), outbound = "direct"),
@@ -318,18 +371,45 @@ class SingBoxCore private constructor(private val context: Context) {
                     }
                 }
 
-                delay(200) // 额外缓冲，增加到200ms确保服务完全就绪
+                // 智能就绪检测：通过实际连接验证代替固定等待
+                // 尝试一次快速连接验证，如果失败则短暂等待后重试
+                var serviceReady = false
+                for (i in 1..3) {
+                    try {
+                        Socket().use { s ->
+                            s.soTimeout = 50
+                            s.connect(InetSocketAddress("127.0.0.1", port), 50)
+                            // 连接成功，尝试发送 HTTP CONNECT 头验证代理就绪
+                            s.getOutputStream().write("CONNECT 127.0.0.1:80 HTTP/1.1\r\n\r\n".toByteArray())
+                            s.getInputStream().read() // 读取一个字节验证响应
+                        }
+                        serviceReady = true
+                        break
+                    } catch (_: Exception) {
+                        if (i < 3) delay(50)
+                    }
+                }
+                if (!serviceReady) {
+                    // 最后的兜底等待
+                    delay(100)
+                }
 
-                // 优化超时配置：
-                // - connectTimeout: 用于建立到本地代理的连接，应该很快
-                // - callTimeout: 整个请求的总超时，包括代理连接到远程服务器的时间
-                val client = OkHttpClient.Builder()
-                    .proxy(Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", port)))
-                    .connectTimeout(2000L, TimeUnit.MILLISECONDS) // 本地代理连接超时
-                    .readTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
-                    .writeTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
-                    .callTimeout(timeoutMs.toLong() + 2000L, TimeUnit.MILLISECONDS) // 整体超时多预留2秒
-                    .build()
+                // 使用精确延迟测试器（参考 NekoBox speedtest.go 实现）
+                // 通过 OkHttp EventListener 精确测量 RTT，排除本地代理连接开销
+                suspend fun runPreciseTest(url: String): Long {
+                    val result = PreciseLatencyTester.test(
+                        proxyPort = port,
+                        url = url,
+                        timeoutMs = timeoutMs,
+                        standard = PreciseLatencyTester.Standard.RTT,
+                        warmup = false // 单节点测试不预热，批量测试会有其他优化
+                    )
+                    return if (result.isSuccess && result.latencyMs <= timeoutMs) {
+                        result.latencyMs
+                    } else {
+                        -1L
+                    }
+                }
 
                 // 判断是否为可重试的连接错误
                 fun isRetryableError(e: Exception): Boolean {
@@ -340,55 +420,35 @@ class SingBoxCore private constructor(private val context: Context) {
                            msg.contains("broken pipe", ignoreCase = true)
                 }
 
-                suspend fun runOnce(url: String): Long {
-                    // Use Dispatchers.IO to prevent NetworkOnMainThreadException even if called from Main
-                    return withContext(Dispatchers.IO) {
-                        val req = Request.Builder().url(url).get().build()
-                        val t0 = System.nanoTime()
-                        client.newCall(req).execute().use { resp ->
-                            if (resp.code >= 400) {
-                                throw java.io.IOException("HTTP proxy test failed with code=${resp.code}")
-                            }
-                            resp.body?.close()
-                        }
-                        val elapsed = (System.nanoTime() - t0) / 1_000_000
-                        // 如果实际耗时超过用户设置的超时时间，视为超时
-                        if (elapsed > timeoutMs) -1L else elapsed
-                    }
-                }
-
-                // 带重试的请求执行
+                // 带重试的精确测试
                 suspend fun runWithRetry(url: String, maxRetries: Int = 2): Long {
-                    var lastException: Exception? = null
+                    var lastResult = -1L
                     repeat(maxRetries) { attempt ->
-                        try {
-                            return runOnce(url)
-                        } catch (e: Exception) {
-                            lastException = e
-                            if (isRetryableError(e) && attempt < maxRetries - 1) {
-                                // 可重试错误，等待后重试
-                                delay(100L * (attempt + 1)) // 递增等待时间
-                            } else {
-                                throw e
-                            }
+                        lastResult = runPreciseTest(url)
+                        if (lastResult >= 0) {
+                            return lastResult
+                        }
+                        if (attempt < maxRetries - 1) {
+                            delay(100L * (attempt + 1))
                         }
                     }
-                    throw lastException ?: java.io.IOException("Unknown error after retries")
+                    return lastResult
                 }
 
-                try {
-                    runWithRetry(targetUrl)
-                } catch (e: Exception) {
+                // 执行精确延迟测试（带 fallback）
+                val primaryResult = runWithRetry(targetUrl)
+                if (primaryResult >= 0) {
+                    primaryResult
+                } else {
                     val fb = fallbackUrl
                     if (!fb.isNullOrBlank() && fb != targetUrl) {
-                        try {
-                            runWithRetry(fb)
-                        } catch (e2: Exception) {
-                            Log.w(TAG, "HTTP proxy native test error: primary=${e.message}, fallback=${e2.message}")
-                            -1L
+                        val fallbackResult = runWithRetry(fb)
+                        if (fallbackResult < 0) {
+                            Log.w(TAG, "Precise latency test failed for both primary and fallback URLs")
                         }
+                        fallbackResult
                     } else {
-                        Log.w(TAG, "HTTP proxy native test error: ${e.message}")
+                        Log.w(TAG, "Precise latency test failed for primary URL")
                         -1L
                     }
                 }
@@ -418,20 +478,11 @@ class SingBoxCore private constructor(private val context: Context) {
     /**
      * 尝试使用 libbox 原生 urlTest 方法进行延迟测试
      *
-     * 注意: 当前官方 libbox.aar 不包含 NekoBox 的 urlTest 接口,此方法直接返回 -1。
-     * 上层逻辑会回退到本地 HTTP 代理测速 (testWithLocalHttpProxy),
-     * 该方式虽非反射调用原生方法,但流量同样经过 libbox 核心,结果准确可靠。
+     * KunBox 扩展内核 (v1.1.0+) 包含 URLTestOutbound 和 URLTestStandalone 方法:
+     * - URLTestOutbound: VPN 运行时，使用当前 BoxService 实例测试
+     * - URLTestStandalone: VPN 未运行时，创建临时实例测试
      *
-     * 如果未来切换到支持 urlTest 的内核 (如 NekoBox/sing-box-extra),
-     * 可以在此处添加反射调用逻辑,参考以下伪代码:
-     *
-     * ```kotlin
-     * val urlTestMethod = Libbox::class.java.methods
-     *     .find { it.name == "urlTest" && it.parameterCount == 3 }
-     * if (urlTestMethod != null) {
-     *     return urlTestMethod.invoke(null, configJson, outbound.tag, url) as Long
-     * }
-     * ```
+     * 如果内核不支持（未使用 KunBox 扩展编译），回退到本地 HTTP 代理测速
      *
      * @return 延迟时间(毫秒), -1 表示不支持或测试失败
      */
@@ -441,7 +492,22 @@ class SingBoxCore private constructor(private val context: Context) {
         timeoutMs: Int,
         method: LatencyTestMethod
     ): Long = withContext(Dispatchers.IO) {
-        // 官方 libbox 不支持 urlTest,直接返回 -1 触发回退
+        try {
+            // 使用 KunBox 扩展内核的 urlTestOutbound 方法
+            val boxService = BoxWrapperManager.getBoxService()
+            if (boxService != null) {
+                // Go 导出到 Java 时方法名首字母小写: URLTestOutbound -> urlTestOutbound
+                val result = boxService.urlTestOutbound(outbound.tag, targetUrl, timeoutMs)
+                if (result >= 0) {
+                    Log.d(TAG, "Native URLTest ${outbound.tag}: ${result}ms")
+                    return@withContext result.toLong()
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Native URLTest failed: ${e.message}")
+        }
+
+        // 不支持或失败，返回 -1 触发回退
         return@withContext -1L
     }
 
@@ -450,16 +516,17 @@ class SingBoxCore private constructor(private val context: Context) {
         targetUrl: String,
         fallbackUrl: String? = null,
         timeoutMs: Int,
-        method: LatencyTestMethod
+        method: LatencyTestMethod,
+        dependencyOutbounds: List<Outbound> = emptyList()
     ): Long = withContext(Dispatchers.IO) {
         // 尝试调用 native 方法 (如果 VPN 正在运行)
-        if (VpnStateStore.getActive(context) && libboxAvailable) {
+        if (VpnStateStore.getActive() && libboxAvailable) {
             val rtt = testWithLibboxStaticUrlTest(outbound, targetUrl, timeoutMs, method)
             if (rtt >= 0) return@withContext rtt
         }
-        
+
         // 内核不支持或未运行，直接走 HTTP 代理测速
-        testWithLocalHttpProxyInternal(outbound, targetUrl, fallbackUrl, timeoutMs)
+        testWithLocalHttpProxyInternal(outbound, targetUrl, fallbackUrl, timeoutMs, dependencyOutbounds)
     }
 
     private suspend fun testOutboundsLatencyOfflineWithTemporaryService(
@@ -570,7 +637,20 @@ class SingBoxCore private constructor(private val context: Context) {
             )
 
             // 确保有 direct 和 block
+            // 关键修复: 先收集所有节点的依赖 outbounds（如 shadowtls）
             val safeOutbounds = ArrayList(batchOutbounds)
+            val addedTags = batchOutbounds.map { it.tag }.toMutableSet()
+
+            // 解析所有节点的依赖
+            for (outbound in batchOutbounds) {
+                val dependencies = resolveDependencyOutbounds(outbound, batchOutbounds)
+                for (dep in dependencies) {
+                    if (addedTags.add(dep.tag)) {
+                        safeOutbounds.add(dep)
+                    }
+                }
+            }
+
             if (safeOutbounds.none { it.tag == "direct" }) safeOutbounds.add(com.kunk.singbox.model.Outbound(type = "direct", tag = "direct"))
             if (safeOutbounds.none { it.tag == "block" }) safeOutbounds.add(com.kunk.singbox.model.Outbound(type = "block", tag = "block"))
             if (safeOutbounds.none { it.tag == "dns-out" }) safeOutbounds.add(com.kunk.singbox.model.Outbound(type = "dns", tag = "dns-out"))
@@ -648,85 +728,75 @@ class SingBoxCore private constructor(private val context: Context) {
                     return
                 }
                 Log.d(TAG, "Batch test: port ready, starting tests for ${batchOutbounds.size} nodes")
-                delay(500) // 额外缓冲，增加到500ms确保所有端口都就绪
 
-                // 4. 并发测试
-                val semaphore = Semaphore(concurrency)
-
-                // 优化超时配置（参考 v2rayNG 的实现）：
-                // - connectTimeout: 本地代理连接，应该很快
-                // - callTimeout: 整个请求的总超时
-                val baseClient = OkHttpClient.Builder()
-                    .connectTimeout(2000L, TimeUnit.MILLISECONDS) // 本地代理连接超时
-                    .readTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
-                    .writeTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
-                    .callTimeout(timeoutMs.toLong() + 2000L, TimeUnit.MILLISECONDS) // 整体超时多预留2秒
-                    .build()
-
-                // 判断是否为可重试的连接错误
-                fun isRetryableError(e: Exception): Boolean {
-                    val msg = e.message ?: ""
-                    return msg.contains("Connection reset", ignoreCase = true) ||
-                           msg.contains("connection closed", ignoreCase = true) ||
-                           msg.contains("Connection refused", ignoreCase = true) ||
-                           msg.contains("broken pipe", ignoreCase = true)
+                // 智能就绪检测：验证多个端口就绪状态，而非固定等待
+                // 抽样检测前几个端口（最多 3 个），确保服务完全就绪
+                val portsToCheck = ports.take(minOf(3, ports.size))
+                var allPortsReady = false
+                for (attempt in 1..5) {
+                    allPortsReady = portsToCheck.all { port ->
+                        try {
+                            Socket().use { s ->
+                                s.soTimeout = 50
+                                s.connect(InetSocketAddress("127.0.0.1", port), 50)
+                            }
+                            true
+                        } catch (_: Exception) {
+                            false
+                        }
+                    }
+                    if (allPortsReady) break
+                    if (attempt < 5) delay(50)
                 }
+                if (!allPortsReady) {
+                    // 兜底短暂等待
+                    delay(100)
+                }
+
+                // 4. 并发测试（使用精确延迟测试器）
+                val semaphore = Semaphore(concurrency)
 
                 coroutineScope {
                     val jobs = portToTagMap.map { (port, originalTag) ->
                         async {
                             semaphore.withPermit {
-                                val client = baseClient.newBuilder()
-                                    .proxy(Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", port)))
-                                    .build()
-
-                                // 单次请求执行
-                                suspend fun runOnce(url: String): Long {
-                                    val t0 = System.nanoTime()
-                                    val req = Request.Builder().url(url).get().build()
-
-                                    client.newCall(req).execute().use { resp ->
-                                        if (resp.code >= 400) {
-                                            throw java.io.IOException("Request failed with code ${resp.code}")
-                                        }
-                                        resp.body?.close()
-                                    }
-                                    val elapsed = (System.nanoTime() - t0) / 1_000_000
-                                    return if (elapsed > timeoutMs) -1L else elapsed
-                                }
-
-                                // 带重试的请求执行
-                                suspend fun runWithRetry(url: String, maxRetries: Int = 2): Long {
-                                    var lastException: Exception? = null
-                                    for (attempt in 0 until maxRetries) {
-                                        try {
-                                            return runOnce(url)
-                                        } catch (e: Exception) {
-                                            lastException = e
-                                            if (isRetryableError(e) && attempt < maxRetries - 1) {
-                                                delay(100L * (attempt + 1))
-                                            } else {
-                                                throw e
-                                            }
-                                        }
-                                    }
-                                    throw lastException ?: java.io.IOException("Unknown error after retries")
-                                }
-
-                                val latency = try {
-                                    runWithRetry(targetUrl)
-                                } catch (e: Exception) {
-                                    Log.w(TAG, "Batch test node $originalTag failed: ${e.message}")
-                                    // 尝试 fallback
-                                    if (fallbackUrl != null && fallbackUrl != targetUrl) {
-                                        try {
-                                            runWithRetry(fallbackUrl)
-                                        } catch (e2: Exception) {
-                                            Log.w(TAG, "Batch test node $originalTag fallback also failed: ${e2.message}")
-                                            -1L
-                                        }
+                                // 使用精确延迟测试器进行批量测试
+                                suspend fun runPreciseTest(url: String): Long {
+                                    val result = PreciseLatencyTester.test(
+                                        proxyPort = port,
+                                        url = url,
+                                        timeoutMs = timeoutMs,
+                                        standard = PreciseLatencyTester.Standard.RTT,
+                                        warmup = false
+                                    )
+                                    return if (result.isSuccess && result.latencyMs <= timeoutMs) {
+                                        result.latencyMs
                                     } else {
                                         -1L
+                                    }
+                                }
+
+                                // 带重试的精确测试
+                                suspend fun runWithRetry(url: String, maxRetries: Int = 2): Long {
+                                    var lastResult = -1L
+                                    for (attempt in 0 until maxRetries) {
+                                        lastResult = runPreciseTest(url)
+                                        if (lastResult >= 0) {
+                                            return lastResult
+                                        }
+                                        if (attempt < maxRetries - 1) {
+                                            delay(100L * (attempt + 1))
+                                        }
+                                    }
+                                    return lastResult
+                                }
+
+                                // 执行精确延迟测试（带 fallback）
+                                var latency = runWithRetry(targetUrl)
+                                if (latency < 0 && fallbackUrl != null && fallbackUrl != targetUrl) {
+                                    latency = runWithRetry(fallbackUrl)
+                                    if (latency < 0) {
+                                        Log.w(TAG, "Batch test node $originalTag: both URLs failed")
                                     }
                                 }
 
@@ -797,16 +867,27 @@ class SingBoxCore private constructor(private val context: Context) {
     /**
      * 测试单个节点的延迟
      * @param outbound 节点出站配置
+     * @param allOutbounds 可选的完整 outbound 列表，用于解析依赖（如 SS+ShadowTLS）
      * @return 延迟时间（毫秒），-1 表示测试失败
      */
-    suspend fun testOutboundLatency(outbound: Outbound): Long = withContext(Dispatchers.IO) {
+    suspend fun testOutboundLatency(
+        outbound: Outbound,
+        allOutbounds: List<Outbound> = emptyList()
+    ): Long = withContext(Dispatchers.IO) {
         val settings = SettingsRepository.getInstance(context).settings.first()
         val timeoutMs = settings.latencyTestTimeout
 
+        // 解析依赖的 outbound（如 SS 节点依赖的 shadowtls）
+        val dependencyOutbounds = if (allOutbounds.isNotEmpty()) {
+            resolveDependencyOutbounds(outbound, allOutbounds)
+        } else {
+            emptyList()
+        }
+
         // When VPN is running, prefer running-instance URLTest.
         // When VPN is stopped, try Libbox static URLTest first, then local HTTP proxy fallback.
-        if (VpnStateStore.getActive(context)) {
-            return@withContext testOutboundLatencyWithLibbox(outbound, settings)
+        if (VpnStateStore.getActive()) {
+            return@withContext testOutboundLatencyWithLibbox(outbound, settings, dependencyOutbounds)
         }
 
         val url = adjustUrlForMode(settings.latencyTestUrl, settings.latencyTestMethod)
@@ -819,12 +900,12 @@ class SingBoxCore private constructor(private val context: Context) {
             }
         } catch (_: Exception) { url }
 
-        val rtt = testWithTemporaryServiceUrlTestOnRunning(outbound, url, fallbackUrl, timeoutMs, settings.latencyTestMethod)
+        val rtt = testWithTemporaryServiceUrlTestOnRunning(outbound, url, fallbackUrl, timeoutMs, settings.latencyTestMethod, dependencyOutbounds)
         if (rtt >= 0) {
             return@withContext rtt
         }
 
-        val fallback = testWithLocalHttpProxy(outbound, url, fallbackUrl, timeoutMs)
+        val fallback = testWithLocalHttpProxy(outbound, url, fallbackUrl, timeoutMs, dependencyOutbounds)
         return@withContext fallback
     }
     
@@ -844,7 +925,7 @@ class SingBoxCore private constructor(private val context: Context) {
         // Otherwise (VPN off OR native URLTest unsupported), use our efficient batch test.
         val isNativeUrlTestSupported = false // Currently false for official libbox
         
-        if (libboxAvailable && VpnStateStore.getActive(context) && isNativeUrlTestSupported) {
+        if (libboxAvailable && VpnStateStore.getActive() && isNativeUrlTestSupported) {
             // 先做一次轻量预热，避免批量首个请求落在 link 验证/路由冷启动窗口
             try {
                 val warmupOutbound = outbounds.firstOrNull()

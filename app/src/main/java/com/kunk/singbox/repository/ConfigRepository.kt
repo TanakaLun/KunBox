@@ -7,7 +7,9 @@ import android.os.Build
 import android.util.Base64
 import android.util.Log
 import com.google.gson.Gson
+import com.google.gson.JsonParser
 import com.google.gson.JsonSyntaxException
+import com.google.gson.reflect.TypeToken
 import com.kunk.singbox.core.SingBoxCore
 import com.kunk.singbox.ipc.VpnStateStore
 import com.kunk.singbox.ipc.SingBoxRemote
@@ -17,19 +19,25 @@ import com.kunk.singbox.service.ProxyOnlyService
 import com.kunk.singbox.utils.parser.Base64Parser
 import com.kunk.singbox.utils.parser.NodeLinkParser
 import com.kunk.singbox.utils.parser.SingBoxParser
+import com.kunk.singbox.repository.config.OutboundFixer
+import com.kunk.singbox.repository.config.InboundBuilder
 import com.kunk.singbox.utils.parser.SubscriptionManager
+import com.kunk.singbox.utils.KryoSerializer
 import com.kunk.singbox.repository.TrafficRepository
 import java.io.File
+import java.util.Collections
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import com.kunk.singbox.utils.NetworkClient
+import com.kunk.singbox.utils.StringBuilderPool
 import org.yaml.snakeyaml.Yaml
 import org.yaml.snakeyaml.error.YAMLException
 
@@ -41,12 +49,89 @@ class ConfigRepository(private val context: Context) {
     companion object {
         private const val TAG = "ConfigRepository"
 
+        // 并行处理的默认并发数
+        private const val PARALLEL_CONCURRENCY = 8
+
+        // 预编译的 Regex 常量 - 避免重复编译
+        private val REGEX_TRAFFIC = Regex("([\\d.]+)\\s*([KMGTPE]?)B?")
+        private val REGEX_KV_PAIRS = Regex("(?i)\\b(upload|download|total|expire)\\b\\s*[:=]\\s*\"?([^,;\\s\\n\\r}]+)\"?")
+        private val REGEX_SUBSCRIPTION_USERINFO = Regex("(?i)subscription[-_]userinfo\\s*[:=]\\s*\"?([^\"\\n\\r]+)\"?")
+        private val REGEX_TOTAL = Regex("TOT:([\\d.]+[KMGTPE]?)B?")
+        private val REGEX_EXPIRE_DATE = Regex("Expires:(\\d{4}-\\d{2}-\\d{2})")
+        private val REGEX_TRAFFIC_VALUE = Regex("([\\d.]+[KMGTPE]?)B?")
+        private val REGEX_REMAINING = Regex("(?i)(剩余流量|流量剩余|remaining|balance)\\s*[:：]?\\s*([\\d.]+\\s*[KMGTPE]?)\\s*B?")
+        private val REGEX_EXPIRE = Regex("(?i)(套餐到期|到期|expiry|expire)\\s*[:：]?\\s*([^\\s,;]+)")
+        private val REGEX_SANITIZE_UUID = Regex("(?i)uuid\\s*[:=]\\s*[^\\\\n]+")
+        private val REGEX_SANITIZE_PASSWORD = Regex("(?i)password\\s*[:=]\\s*[^\\\\n]+")
+        private val REGEX_SANITIZE_TOKEN = Regex("(?i)token\\s*[:=]\\s*[^\\\\n]+")
+        private val REGEX_FLAG_EMOJI = Regex("[\\uD83C][\\uDDE6-\\uDDFF][\\uD83C][\\uDDE6-\\uDDFF]")
+        private val REGEX_INTERVAL_DIGITS = Regex("^\\d+$")
+        private val REGEX_INTERVAL_DECIMAL = Regex("^\\d+\\.\\d+$")
+        private val REGEX_INTERVAL_UNIT = Regex("^\\d+[smhd]$", RegexOption.IGNORE_CASE)
+        private val REGEX_IPV4 = Regex("^(?:\\d{1,3}\\.){3}\\d{1,3}$")
+        private val REGEX_IPV6 = Regex("^[0-9a-fA-F:]+$")
+        private val REGEX_ED_PARAM_START = Regex("""\?ed=\d+(&|$)""")
+        private val REGEX_ED_PARAM_MID = Regex("""&ed=\d+""")
+        private val REGEX_ED_EXTRACT = Regex("""[?&]ed=(\d+)""")
+        private val REGEX_SS_OLD_FORMAT = Regex("(.+):(.+)@(.+):(\\d+)")
+        private val REGEX_WHITESPACE_DASH = Regex("[\\s\\-_]")
+
+        // 预编译的地区检测规则 - 避免每次调用都编译 Regex
+        private data class RegionRule(
+            val flag: String,
+            val chineseKeywords: List<String>,
+            val englishKeywords: List<String>,
+            val wordBoundaryKeywords: List<String> // 需要词边界匹配的短代码
+        )
+
+        private val REGION_RULES = listOf(
+            RegionRule("🇭🇰", listOf("香港"), listOf("hong kong"), listOf("hk")),
+            RegionRule("🇹🇼", listOf("台湾"), listOf("taiwan"), listOf("tw")),
+            RegionRule("🇯🇵", listOf("日本"), listOf("japan", "tokyo"), listOf("jp")),
+            RegionRule("🇸🇬", listOf("新加坡"), listOf("singapore"), listOf("sg")),
+            RegionRule("🇺🇸", listOf("美国"), listOf("united states", "america"), listOf("us", "usa")),
+            RegionRule("🇰🇷", listOf("韩国"), listOf("korea"), listOf("kr")),
+            RegionRule("🇬🇧", listOf("英国"), listOf("britain", "england"), listOf("uk", "gb")),
+            RegionRule("🇩🇪", listOf("德国"), listOf("germany"), listOf("de")),
+            RegionRule("🇫🇷", listOf("法国"), listOf("france"), listOf("fr")),
+            RegionRule("🇨🇦", listOf("加拿大"), listOf("canada"), listOf("ca")),
+            RegionRule("🇦🇺", listOf("澳大利亚"), listOf("australia"), listOf("au")),
+            RegionRule("🇷🇺", listOf("俄罗斯"), listOf("russia"), listOf("ru")),
+            RegionRule("🇮🇳", listOf("印度"), listOf("india"), listOf("in")),
+            RegionRule("🇧🇷", listOf("巴西"), listOf("brazil"), listOf("br")),
+            RegionRule("🇳🇱", listOf("荷兰"), listOf("netherlands"), listOf("nl")),
+            RegionRule("🇹🇷", listOf("土耳其"), listOf("turkey"), listOf("tr")),
+            RegionRule("🇦🇷", listOf("阿根廷"), listOf("argentina"), listOf("ar")),
+            RegionRule("🇲🇾", listOf("马来西亚"), listOf("malaysia"), listOf("my")),
+            RegionRule("🇹🇭", listOf("泰国"), listOf("thailand"), listOf("th")),
+            RegionRule("🇻🇳", listOf("越南"), listOf("vietnam"), listOf("vn")),
+            RegionRule("🇵🇭", listOf("菲律宾"), listOf("philippines"), listOf("ph")),
+            RegionRule("🇮🇩", listOf("印尼"), listOf("indonesia"), listOf("id"))
+        )
+
+        // 预编译词边界 Regex Map
+        private val WORD_BOUNDARY_REGEX_MAP: Map<String, Regex> = REGION_RULES
+            .flatMap { it.wordBoundaryKeywords }
+            .associateWith { word -> Regex("(^|[^a-z])${Regex.escape(word)}([^a-z]|$)") }
+
+        // 地区检测缓存
+        private val regionFlagCache = ConcurrentHashMap<String, String>()
+
+        // stableNodeId 缓存
+        private val nodeIdCache = ConcurrentHashMap<String, String>()
+
         /**
          * 生成稳定的节点 ID（基于 profileId 和 outboundTag 的 UUID）
+         * 使用缓存避免重复计算
          */
         fun stableNodeId(profileId: String, outboundTag: String): String {
             val key = "$profileId|$outboundTag"
-            return java.util.UUID.nameUUIDFromBytes(key.toByteArray(Charsets.UTF_8)).toString()
+            return nodeIdCache.getOrPut(key) {
+                StringBuilderPool.use { sb ->
+                    sb.append(profileId).append('|').append(outboundTag)
+                    java.util.UUID.nameUUIDFromBytes(sb.toString().toByteArray(Charsets.UTF_8)).toString()
+                }
+            }
         }
 
         // User-Agent 列表，按优先级排序
@@ -74,6 +159,16 @@ class ConfigRepository(private val context: Context) {
     private val settingsRepository = SettingsRepository.getInstance(context)
 
     /**
+     * 缓存的设置值 - 避免在同步方法中使用 runBlocking
+     *
+     * 优化说明:
+     * - 通过 StateFlow 订阅设置变化，自动更新缓存
+     * - getClient() 等同步方法可直接读取缓存，无需阻塞
+     */
+    @Volatile
+    private var cachedSettings: AppSettings? = null
+
+    /**
      * 获取实际使用的 TUN 栈模式
      * 针对特定不支持 System 模式的设备强制使用 gVisor
      * 否则返回用户选择的模式
@@ -93,8 +188,9 @@ class ConfigRepository(private val context: Context) {
     // client 改为动态获取，以支持可配置的超时
     // 使用不带重试的 Client，避免订阅获取时超时时间被重试机制延长
     // 当 VPN 运行时，使用代理客户端让请求走 sing-box 代理
+    // 优化: 使用缓存的 settings 值，避免 runBlocking 阻塞
     private fun getClient(): okhttp3.OkHttpClient {
-        val settings = runBlocking { settingsRepository.settings.first() }
+        val settings = cachedSettings ?: AppSettings() // 使用缓存，无阻塞；首次为空时使用默认值
         val timeout = settings.subscriptionUpdateTimeout.toLong()
 
         // 检测 VPN 是否正在运行，如果是则使用代理
@@ -109,11 +205,14 @@ class ConfigRepository(private val context: Context) {
     }
     
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    
+
+    // 节点链接解析器 - 复用实例避免重复创建
+    private val nodeLinkParser = NodeLinkParser(gson)
+
     private val subscriptionManager = SubscriptionManager(listOf(
         SingBoxParser(gson),
         com.kunk.singbox.utils.parser.ClashYamlParser(),
-        Base64Parser { NodeLinkParser(gson).parse(it) }
+        Base64Parser { nodeLinkParser.parse(it) }
     ))
 
     private val _profiles = MutableStateFlow<List<ProfileUi>>(emptyList())
@@ -124,25 +223,32 @@ class ConfigRepository(private val context: Context) {
 
     private val _allNodes = MutableStateFlow<List<NodeUi>>(emptyList())
     val allNodes: StateFlow<List<NodeUi>> = _allNodes.asStateFlow()
-    
-    private val _nodeGroups = MutableStateFlow<List<String>>(listOf("全部"))
-    val nodeGroups: StateFlow<List<String>> = _nodeGroups.asStateFlow()
 
-    private val _allNodeGroups = MutableStateFlow<List<String>>(emptyList())
-    val allNodeGroups: StateFlow<List<String>> = _allNodeGroups.asStateFlow()
-    
     private val _activeProfileId = MutableStateFlow<String?>(null)
     val activeProfileId: StateFlow<String?> = _activeProfileId.asStateFlow()
     
     private val _activeNodeId = MutableStateFlow<String?>(null)
     val activeNodeId: StateFlow<String?> = _activeNodeId.asStateFlow()
     
-    private val maxConfigCacheSize = 2
-    private val configCache = ConcurrentHashMap<String, SingBoxConfig>()
-    private val configCacheOrder = java.util.concurrent.ConcurrentLinkedDeque<String>()
+    private val maxConfigCacheSize = 10
+    // 使用 LinkedHashMap 实现 LRU 缓存，线程安全
+    private val configCache: MutableMap<String, SingBoxConfig> = Collections.synchronizedMap(
+        object : LinkedHashMap<String, SingBoxConfig>(maxConfigCacheSize, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, SingBoxConfig>?): Boolean {
+                return size > maxConfigCacheSize
+            }
+        }
+    )
     private val profileNodes = ConcurrentHashMap<String, List<NodeUi>>()
     private val profileResetJobs = ConcurrentHashMap<String, kotlinx.coroutines.Job>()
     private val inFlightLatencyTests = ConcurrentHashMap<String, Deferred<Long>>()
+
+    // 保存从持久化存储加载的延时数据，用于在 setAllNodesUiActive 时恢复
+    private val savedNodeLatencies = ConcurrentHashMap<String, Long>()
+
+    // saveProfiles 防抖
+    @Volatile private var saveProfilesJob: kotlinx.coroutines.Job? = null
+    private val saveDebounceMs = 300L
 
     private val allNodesUiActiveCount = AtomicInteger(0)
     @Volatile private var allNodesLoadedForUi: Boolean = false
@@ -169,12 +275,55 @@ class ConfigRepository(private val context: Context) {
     
     private val configDir: File
         get() = File(context.filesDir, "configs").also { it.mkdirs() }
-    
-    private val profilesFile: File
+
+    // Kryo 二进制格式的配置文件
+    private val profilesFileKryo: File
+        get() = File(context.filesDir, "profiles.kryo")
+
+    // JSON 格式的配置文件（用于向后兼容和迁移）
+    private val profilesFileJson: File
         get() = File(context.filesDir, "profiles.json")
+
+    // 优先使用 Kryo 格式，如果不存在则回退到 JSON
+    private val profilesFile: File
+        get() = if (profilesFileKryo.exists()) profilesFileKryo else profilesFileJson
     
     init {
+        // 注册 Kryo 版本迁移器
+        registerKryoMigrators()
         loadSavedProfiles()
+
+        // 订阅设置变化，自动更新缓存 (性能优化: 避免 getClient 中使用 runBlocking)
+        scope.launch {
+            settingsRepository.settings.collect { settings ->
+                cachedSettings = settings
+            }
+        }
+    }
+
+    /**
+     * 注册 Kryo 数据版本迁移器
+     * 当 SavedProfilesData 结构发生变化时，在此添加迁移逻辑
+     *
+     * 使用方法:
+     * 1. 修改 SavedProfilesData 结构后，递增 KryoSerializer.CURRENT_VERSION
+     * 2. 在此注册从旧版本到新版本的迁移器
+     */
+    private fun registerKryoMigrators() {
+        // 版本 0 -> 1: 旧格式(无魔数)迁移到新格式
+        // 当前数据结构不变，仅添加文件头，无需特殊处理
+        KryoSerializer.registerMigrator(0) { data -> data }
+
+        // 未来版本迁移示例:
+        // KryoSerializer.registerMigrator(1) { data ->
+        //     when (data) {
+        //         is SavedProfilesData -> {
+        //             // 例如: 添加新字段 newField
+        //             data.copy(newField = "defaultValue")
+        //         }
+        //         else -> data
+        //     }
+        // }
     }
     
     private fun loadConfig(profileId: String): SingBoxConfig? {
@@ -197,22 +346,34 @@ class ConfigRepository(private val context: Context) {
 
     private fun cacheConfig(profileId: String, config: SingBoxConfig) {
         configCache[profileId] = config
-        configCacheOrder.remove(profileId)
-        configCacheOrder.addLast(profileId)
-        while (configCache.size > maxConfigCacheSize && configCacheOrder.isNotEmpty()) {
-            val oldest = configCacheOrder.pollFirst()
-            if (oldest != null && oldest != profileId) {
-                configCache.remove(oldest)
-            }
-        }
     }
 
     private fun removeCachedConfig(profileId: String) {
         configCache.remove(profileId)
-        configCacheOrder.remove(profileId)
     }
 
+    /**
+     * 保存配置 - 使用防抖机制，合并短时间内的多次调用
+     */
     private fun saveProfiles() {
+        saveProfilesJob?.cancel()
+        saveProfilesJob = scope.launch {
+            delay(saveDebounceMs)
+            saveProfilesInternal()
+        }
+    }
+
+    /**
+     * 立即保存配置 - 跳过防抖，用于关键操作
+     */
+    private fun saveProfilesImmediate() {
+        saveProfilesJob?.cancel()
+        scope.launch {
+            saveProfilesInternal()
+        }
+    }
+
+    private fun saveProfilesInternal() {
         try {
             // 收集所有节点的延迟数据
             val latencies = mutableMapOf<String, Long>()
@@ -227,26 +388,33 @@ class ConfigRepository(private val context: Context) {
                 nodeLatencies = latencies
             )
 
-            val json = gson.toJson(data)
+            // 使用 Kryo 二进制序列化（更快、更小）
+            val success = KryoSerializer.serializeToFile(data, profilesFileKryo)
 
-            // Robust atomic write implementation
-            val tmpFile = File(profilesFile.parent, "${profilesFile.name}.tmp")
-            try {
-                tmpFile.writeText(json)
-                if (tmpFile.exists() && tmpFile.length() > 0) {
-                    if (profilesFile.exists()) {
-                        profilesFile.delete()
-                    }
-                    if (!tmpFile.renameTo(profilesFile)) {
-                        Log.e(TAG, "Rename failed, falling back to copy")
-                        tmpFile.copyTo(profilesFile, overwrite = true)
-                        tmpFile.delete()
-                    }
-                } else {
-                    Log.e(TAG, "Tmp file is empty, skipping save to prevent data corruption")
+            if (success) {
+                // 成功保存 Kryo 格式后，删除旧的 JSON 文件
+                if (profilesFileJson.exists()) {
+                    profilesFileJson.delete()
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Internal error during save write", e)
+            } else {
+                // Kryo 失败时回退到 JSON
+                Log.w(TAG, "Kryo serialization failed, falling back to JSON")
+                val json = gson.toJson(data)
+                val tmpFile = File(profilesFileJson.parent, "${profilesFileJson.name}.tmp")
+                try {
+                    tmpFile.writeText(json)
+                    if (tmpFile.exists() && tmpFile.length() > 0) {
+                        if (profilesFileJson.exists()) {
+                            profilesFileJson.delete()
+                        }
+                        if (!tmpFile.renameTo(profilesFileJson)) {
+                            tmpFile.copyTo(profilesFileJson, overwrite = true)
+                            tmpFile.delete()
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "JSON fallback also failed", e)
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to save profiles", e)
@@ -256,25 +424,31 @@ class ConfigRepository(private val context: Context) {
     private fun updateAllNodesAndGroups() {
         if (allNodesUiActiveCount.get() <= 0) {
             _allNodes.value = emptyList()
-            _allNodeGroups.value = emptyList()
             return
         }
 
         val all = profileNodes.values.flatten()
         _allNodes.value = all
-
-        val groups = all.map { it.group }.distinct().sorted()
-        _allNodeGroups.value = groups
     }
 
-    private fun loadAllNodesSnapshot(): List<NodeUi> {
-        val result = ArrayList<NodeUi>()
+    /**
+     * 加载所有节点快照
+     *
+     * 优化说明:
+     * - 改为 suspend 函数，移除 runBlocking 阻塞
+     * - 使用协程并行处理多个配置文件，提升性能
+     */
+    private suspend fun loadAllNodesSnapshot(): List<NodeUi> = withContext(Dispatchers.IO) {
         val profiles = _profiles.value
-        for (p in profiles) {
-            val cfg = loadConfig(p.id) ?: continue
-            result.addAll(extractNodesFromConfig(cfg, p.id))
-        }
-        return result
+        if (profiles.isEmpty()) return@withContext emptyList()
+
+        // 并行提取各配置的节点
+        profiles.map { p ->
+            async {
+                val cfg = loadConfig(p.id) ?: return@async emptyList()
+                extractNodesFromConfig(cfg, p.id)
+            }
+        }.awaitAll().flatten()
     }
 
     fun setAllNodesUiActive(active: Boolean) {
@@ -285,7 +459,13 @@ class ConfigRepository(private val context: Context) {
                     val profiles = _profiles.value
                     for (p in profiles) {
                         val cfg = loadConfig(p.id) ?: continue
-                        profileNodes[p.id] = extractNodesFromConfig(cfg, p.id)
+                        val nodes = extractNodesFromConfig(cfg, p.id)
+                        // 恢复已保存的延时数据
+                        val nodesWithLatency = nodes.map { node ->
+                            val latency = savedNodeLatencies[node.id]
+                            if (latency != null) node.copy(latencyMs = latency) else node
+                        }
+                        profileNodes[p.id] = nodesWithLatency
                     }
                     updateAllNodesAndGroups()
                     allNodesLoadedForUi = true
@@ -306,12 +486,17 @@ class ConfigRepository(private val context: Context) {
                     profileNodes[activeId] = keep
                 }
                 _allNodes.value = emptyList()
-                _allNodeGroups.value = emptyList()
             }
         }
     }
 
     private fun updateLatencyInAllNodes(nodeId: String, latency: Long) {
+        // 同步更新 savedNodeLatencies，确保退出节点页面再进入时延时数据仍然可用
+        if (latency > 0) {
+            savedNodeLatencies[nodeId] = latency
+        } else {
+            savedNodeLatencies[nodeId] = -1L
+        }
         _allNodes.update { list ->
             list.map {
                 if (it.id == nodeId) it.copy(latencyMs = if (latency > 0) latency else -1L) else it
@@ -329,79 +514,76 @@ class ConfigRepository(private val context: Context) {
 
     private fun loadSavedProfiles() {
         try {
-            if (profilesFile.exists()) {
-                val json = profilesFile.readText()
-                val savedData = gson.fromJson(json, SavedProfilesData::class.java)
-                
-                // Gson 有时会将泛型列表中的对象反序列化为 LinkedTreeMap，而不是目标对象 (ProfileUi)
-                // 这通常发生在类型擦除或混淆导致类型信息丢失的情况下
-                // 强制转换或重新映射以确保类型正确
-                val safeProfiles = savedData.profiles.map { profile ->
-                    // 强制转换为 Any? 以绕过编译器的类型检查，
-                    // 因为在运行时 profile 可能是 LinkedTreeMap (类型擦除导致)
-                    // 即使声明类型是 ProfileUi
-                    val obj = profile as Any?
-                    if (obj is com.google.gson.internal.LinkedTreeMap<*, *>) {
-                        val jsonStr = gson.toJson(obj)
-                        gson.fromJson(jsonStr, ProfileUi::class.java)
-                    } else {
-                        profile
-                    }
+            val savedData: SavedProfilesData? = when {
+                // 优先尝试 Kryo 格式
+                profilesFileKryo.exists() -> {
+                    KryoSerializer.deserializeFromFile<SavedProfilesData>(profilesFileKryo)
                 }
+                // 回退到 JSON 格式（向后兼容）
+                profilesFileJson.exists() -> {
+                    val json = profilesFileJson.readText()
+                    val savedDataType = object : TypeToken<SavedProfilesData>() {}.type
+                    gson.fromJson<SavedProfilesData>(json, savedDataType)
+                }
+                else -> null
+            }
 
+            if (savedData != null) {
                 // 加载时重置所有配置的更新状态为 Idle，防止因异常退出导致一直显示更新中
-                _profiles.value = safeProfiles.map {
+                _profiles.value = savedData.profiles.map {
                     it.copy(updateStatus = UpdateStatus.Idle)
                 }
                 _activeProfileId.value = savedData.activeProfileId
-                
-                // 加载活跃配置的节点
+
+                // 保存延时数据到成员变量，供后续 setAllNodesUiActive 使用
+                savedNodeLatencies.clear()
+                savedNodeLatencies.putAll(savedData.nodeLatencies)
+
+                // 加载活跃配置的节点 (异步执行，避免阻塞 init)
                 savedData.profiles.forEach { profile ->
                     if (profile.id != savedData.activeProfileId) return@forEach
                     val configFile = File(configDir, "${profile.id}.json")
                     if (configFile.exists()) {
-                        try {
-                            val configJson = configFile.readText()
-                            val config = gson.fromJson(configJson, SingBoxConfig::class.java)
-                            val nodes = extractNodesFromConfig(config, profile.id)
-                            // 恢复延迟数据
-                            val nodesWithLatency = nodes.map { node ->
-                                val latency = savedData.nodeLatencies[node.id]
-                                if (latency != null) node.copy(latencyMs = latency) else node
+                        // 优化: 使用协程异步加载节点，避免 runBlocking 阻塞
+                        scope.launch {
+                            try {
+                                val configJson = configFile.readText()
+                                val config = gson.fromJson(configJson, SingBoxConfig::class.java)
+                                val nodes = extractNodesFromConfig(config, profile.id)
+                                // 恢复延迟数据
+                                val nodesWithLatency = nodes.map { node ->
+                                    val latency = savedData.nodeLatencies[node.id]
+                                    if (latency != null) node.copy(latencyMs = latency) else node
+                                }
+                                profileNodes[profile.id] = nodesWithLatency
+                                cacheConfig(profile.id, config)
+
+                                // 更新 UI 状态
+                                if (profile.id == _activeProfileId.value) {
+                                    _nodes.value = nodesWithLatency
+                                    val restored = savedData.activeNodeId
+                                    _activeNodeId.value = when {
+                                        !restored.isNullOrBlank() && nodesWithLatency.any { it.id == restored } -> restored
+                                        nodesWithLatency.isNotEmpty() -> nodesWithLatency.first().id
+                                        else -> null
+                                    }
+                                }
+                                if (allNodesUiActiveCount.get() > 0) {
+                                    updateAllNodesAndGroups()
+                                }
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Failed to load config for profile: ${profile.id}", e)
                             }
-                            profileNodes[profile.id] = nodesWithLatency
-                            cacheConfig(profile.id, config)
-                        } catch (e: Exception) {
-                            Log.e(TAG, "Failed to load config for profile: ${profile.id}", e)
                         }
                     }
                 }
-                if (allNodesUiActiveCount.get() > 0) {
-                    updateAllNodesAndGroups()
-                }
-                
-                _activeProfileId.value?.let { activeId ->
-                    profileNodes[activeId]?.let { nodes ->
-                        _nodes.value = nodes
-                        updateNodeGroups(nodes)
-                        val restored = savedData.activeNodeId
-                        _activeNodeId.value = when {
-                            !restored.isNullOrBlank() && nodes.any { it.id == restored } -> {
-                                restored
-                            }
-                            nodes.isNotEmpty() -> {
-                                nodes.first().id
-                            }
-                            else -> {
-                                Log.w(TAG, "loadSavedProfiles: No nodes available, activeNodeId set to null")
-                                null
-                            }
-                        }
-                    } ?: run {
-                        Log.w(TAG, "loadSavedProfiles: profileNodes[$activeId] is null, activeNodeId not restored")
+
+                // 如果从 JSON 加载成功，自动迁移到 Kryo 格式
+                if (profilesFileJson.exists() && !profilesFileKryo.exists()) {
+                    scope.launch {
+                        saveProfilesInternal()
+                        Log.i(TAG, "Migrated profiles from JSON to Kryo format")
                     }
-                } ?: run {
-                    Log.w(TAG, "loadSavedProfiles: activeProfileId is null, activeNodeId not restored")
                 }
             }
         } catch (e: Exception) {
@@ -429,8 +611,7 @@ class ConfigRepository(private val context: Context) {
      */
     private fun parseTrafficString(value: String): Long {
         val trimmed = value.trim().uppercase()
-        val regex = Regex("([\\d.]+)\\s*([KMGTPE]?)B?")
-        val match = regex.find(trimmed) ?: return 0L
+        val match = REGEX_TRAFFIC.find(trimmed) ?: return 0L
         
         val (numStr, unit) = match.destructured
         val num = numStr.toDoubleOrNull() ?: return 0L
@@ -519,8 +700,7 @@ class ConfigRepository(private val context: Context) {
         }
 
         fun parseKeyValuePairs(text: String) {
-            val kvRegex = Regex("(?i)\\b(upload|download|total|expire)\\b\\s*[:=]\\s*\"?([^,;\\s\\n\\r}]+)\"?")
-            kvRegex.findAll(text).forEach { match ->
+            REGEX_KV_PAIRS.findAll(text).forEach { match ->
                 applyKeyValue(match.groupValues[1], match.groupValues[2])
             }
         }
@@ -552,7 +732,7 @@ class ConfigRepository(private val context: Context) {
                 if (userInfoAltIndex >= 0) {
                     val endIndex = (userInfoAltIndex + 800).coerceAtMost(bodyDecoded.length)
                     val snippet = bodyDecoded.substring(userInfoAltIndex, endIndex)
-                    val inlineMatch = Regex("(?i)subscription[-_]userinfo\\s*[:=]\\s*\"?([^\"\\n\\r]+)\"?").find(snippet)
+                    val inlineMatch = REGEX_SUBSCRIPTION_USERINFO.find(snippet)
                     if (inlineMatch != null) {
                         parseHeaderLike(inlineMatch.groupValues[1])
                     }
@@ -562,7 +742,7 @@ class ConfigRepository(private val context: Context) {
                 val firstLine = bodyDecoded.lines().firstOrNull()?.trim()
                 if (firstLine != null && (firstLine.startsWith("STATUS=") || firstLine.contains("TOT:") || firstLine.contains("Expires:"))) {
                     // 解析 TOT:
-                    val totalMatch = Regex("TOT:([\\d.]+[KMGTPE]?)B?").find(firstLine)
+                    val totalMatch = REGEX_TOTAL.find(firstLine)
                     if (totalMatch != null) {
                         totalSpecified = true
                         total = parseTrafficString(totalMatch.groupValues[1])
@@ -570,7 +750,7 @@ class ConfigRepository(private val context: Context) {
                     }
 
                     // 解析 Expires:
-                    val expireMatch = Regex("Expires:(\\d{4}-\\d{2}-\\d{2})").find(firstLine)
+                    val expireMatch = REGEX_EXPIRE_DATE.find(firstLine)
                     if (expireMatch != null) {
                         expire = parseDateString(expireMatch.groupValues[1])
                         found = true
@@ -591,7 +771,7 @@ class ConfigRepository(private val context: Context) {
                         if (part.contains("Expires:")) return@forEach
 
                         // 提取流量值
-                        val match = Regex("([\\d.]+[KMGTPE]?)B?").find(part)
+                        val match = REGEX_TRAFFIC_VALUE.find(part)
                         if (match != null) {
                             usedAccumulator += parseTrafficString(match.groupValues[1])
                             found = true
@@ -621,19 +801,16 @@ class ConfigRepository(private val context: Context) {
         var remainingBytes: Long? = null
         var expireValue: Long? = null
 
-        val remainingRegex = Regex("(?i)(剩余流量|流量剩余|remaining|balance)\\s*[:：]?\\s*([\\d.]+\\s*[KMGTPE]?)\\s*B?")
-        val expireRegex = Regex("(?i)(套餐到期|到期|expiry|expire)\\s*[:：]?\\s*([^\\s,;]+)")
-
         outbounds.forEach { outbound ->
             val tag = outbound.tag
             if (remainingBytes == null) {
-                val match = remainingRegex.find(tag)
+                val match = REGEX_REMAINING.find(tag)
                 if (match != null) {
                     remainingBytes = parseTrafficString(match.groupValues[2])
                 }
             }
             if (expireValue == null) {
-                val match = expireRegex.find(tag)
+                val match = REGEX_EXPIRE.find(tag)
                 if (match != null) {
                     expireValue = parseExpireValue(match.groupValues[2])
                 }
@@ -754,9 +931,9 @@ class ConfigRepository(private val context: Context) {
             .trim()
         if (s.length > maxLen) s = s.substring(0, maxLen)
 
-        s = s.replace(Regex("(?i)uuid\\s*[:=]\\s*[^\\\\n]+"), "uuid:***")
-        s = s.replace(Regex("(?i)password\\s*[:=]\\s*[^\\\\n]+"), "password:***")
-        s = s.replace(Regex("(?i)token\\s*[:=]\\s*[^\\\\n]+"), "token:***")
+        s = s.replace(REGEX_SANITIZE_UUID, "uuid:***")
+        s = s.replace(REGEX_SANITIZE_PASSWORD, "password:***")
+        s = s.replace(REGEX_SANITIZE_TOKEN, "token:***")
         return s
     }
 
@@ -952,24 +1129,55 @@ class ConfigRepository(private val context: Context) {
     }
     
     /**
-     * 解析订阅响应
+     * 从配置中只提取节点信息，忽略规则配置
+     * 防止因 sing-box 规则版本更新导致解析失败
      */
+    private fun extractOutboundsOnly(config: SingBoxConfig): SingBoxConfig {
+        val outbounds = config.outbounds ?: config.proxies ?: emptyList()
+        return SingBoxConfig(outbounds = outbounds)
+    }
+
+    /**
+     * 从 JSON 字符串中宽松提取 outbounds 节点列表
+     * 只解析 outbounds/proxies 字段，忽略其他可能不兼容的字段（如 route、dns 等）
+     * 防止因 sing-box 规则版本更新导致整体解析失败
+     */
+    private fun extractOutboundsFromJson(jsonContent: String): List<Outbound>? {
+        val trimmed = jsonContent.trim()
+        if (!trimmed.startsWith("{")) return null
+
+        return try {
+            val jsonObject = JsonParser.parseString(trimmed).asJsonObject
+
+            // 优先尝试 outbounds 字段
+            val outboundsElement = jsonObject.get("outbounds") ?: jsonObject.get("proxies")
+            if (outboundsElement != null && outboundsElement.isJsonArray) {
+                val outboundListType = object : TypeToken<List<Outbound>>() {}.type
+                val outbounds: List<Outbound> = gson.fromJson(outboundsElement, outboundListType)
+                if (outbounds.isNotEmpty()) {
+                    return outbounds
+                }
+            }
+            null
+        } catch (e: Exception) {
+            Log.w(TAG, "extractOutboundsFromJson failed: ${e.message}")
+            null
+        }
+    }
+
     private fun parseSubscriptionResponse(content: String): SingBoxConfig? {
         val normalizedContent = normalizeImportedContent(content)
 
-        // 1. 尝试直接解析为 sing-box JSON
+        // 1. 尝试直接解析为 sing-box JSON (只提取节点信息，使用宽松解析避免规则字段不兼容)
         try {
-            val config = gson.fromJson(normalizedContent, SingBoxConfig::class.java)
-            // 兼容 outbounds 在 proxies 字段的情况
-            val outbounds = config.outbounds ?: config.proxies
+            val outbounds = extractOutboundsFromJson(normalizedContent)
             if (outbounds != null && outbounds.isNotEmpty()) {
-                // 如果是从 proxies 字段读取的，需要将其移动到 outbounds 字段
-                return if (config.outbounds == null) config.copy(outbounds = outbounds) else config
+                return SingBoxConfig(outbounds = outbounds)
             } else {
                 Log.w(TAG, "Parsed as JSON but outbounds/proxies is empty/null. content snippet: ${sanitizeSubscriptionSnippet(normalizedContent)}")
             }
-        } catch (e: JsonSyntaxException) {
-            Log.w(TAG, "Failed to parse as JSON: ${e.message}")
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to extract outbounds from JSON: ${e.message}")
             // 继续尝试其他格式
         }
 
@@ -977,35 +1185,34 @@ class ConfigRepository(private val context: Context) {
         try {
             val yamlConfig = parseClashYamlConfig(normalizedContent)
             if (yamlConfig?.outbounds != null && yamlConfig.outbounds.isNotEmpty()) {
-                return yamlConfig
+                return extractOutboundsOnly(yamlConfig)
             }
         } catch (_: Exception) {
         }
-        
+
         // 2. 尝试 Base64 解码后解析
         try {
             val decoded = tryDecodeBase64(normalizedContent)
             if (decoded.isNullOrBlank()) {
                 throw IllegalStateException("base64 decode failed")
             }
-            
-            // 尝试解析解码后的内容为 JSON
+
+            // 尝试解析解码后的内容为 JSON (使用宽松解析只提取节点)
             try {
-                val config = gson.fromJson(decoded, SingBoxConfig::class.java)
-                val outbounds = config.outbounds ?: config.proxies
+                val outbounds = extractOutboundsFromJson(decoded)
                 if (outbounds != null && outbounds.isNotEmpty()) {
-                    return if (config.outbounds == null) config.copy(outbounds = outbounds) else config
+                    return SingBoxConfig(outbounds = outbounds)
                 } else {
                     Log.w(TAG, "Parsed decoded Base64 as JSON but outbounds is empty/null")
                 }
             } catch (e: Exception) {
-                Log.w(TAG, "Failed to parse decoded Base64 as JSON: ${e.message}")
+                Log.w(TAG, "Failed to extract outbounds from decoded Base64 JSON: ${e.message}")
             }
 
             try {
                 val yamlConfig = parseClashYamlConfig(decoded)
                 if (yamlConfig?.outbounds != null && yamlConfig.outbounds.isNotEmpty()) {
-                    return yamlConfig
+                    return extractOutboundsOnly(yamlConfig)
                 }
             } catch (_: Exception) {
             }
@@ -1039,685 +1246,40 @@ class ConfigRepository(private val context: Context) {
                 if (outbounds.isNotEmpty()) {
                     // 创建一个包含这些节点的配置
                     return SingBoxConfig(
-                        outbounds = outbounds + listOf(
-                            Outbound(type = "direct", tag = "direct"),
-                            Outbound(type = "block", tag = "block")
-                        )
+                        outbounds = outbounds
                     )
                 }
             }
         } catch (e: Exception) {
             e.printStackTrace()
         }
-        
+
         return null
     }
-    
+
     /**
-     * 解析单个节点链接
+     * 解析单个节点链接 - 委托给 NodeLinkParser
      */
     private fun parseNodeLink(link: String): Outbound? {
-        return when {
-            link.startsWith("ss://") -> parseShadowsocksLink(link)
-            link.startsWith("vmess://") -> parseVMessLink(link)
-            link.startsWith("vless://") -> parseVLessLink(link)
-            link.startsWith("trojan://") -> parseTrojanLink(link)
-            link.startsWith("hysteria2://") || link.startsWith("hy2://") -> parseHysteria2Link(link)
-            link.startsWith("hysteria://") -> parseHysteriaLink(link)
-            link.startsWith("anytls://") -> parseAnyTLSLink(link)
-            link.startsWith("tuic://") -> parseTuicLink(link)
-            link.startsWith("wireguard://") -> parseWireGuardLink(link)
-            link.startsWith("ssh://") -> parseSSHLink(link)
-            else -> null
-        }
-    }
-    
-    private fun parseShadowsocksLink(link: String): Outbound? {
-        try {
-            // ss://BASE64(method:password)@server:port#name
-            // 或 ss://BASE64(method:password@server:port)#name
-            val uri = link.removePrefix("ss://")
-            val nameIndex = uri.lastIndexOf('#')
-            val name = if (nameIndex > 0) java.net.URLDecoder.decode(uri.substring(nameIndex + 1), "UTF-8") else "SS Node"
-            val mainPart = if (nameIndex > 0) uri.substring(0, nameIndex) else uri
-            
-            val atIndex = mainPart.lastIndexOf('@')
-            if (atIndex > 0) {
-                // 新格式: BASE64(method:password)@server:port
-                val userInfo = String(Base64.decode(mainPart.substring(0, atIndex), Base64.URL_SAFE or Base64.NO_PADDING))
-                val serverPart = mainPart.substring(atIndex + 1)
-                val colonIndex = serverPart.lastIndexOf(':')
-                val server = serverPart.substring(0, colonIndex)
-                val port = serverPart.substring(colonIndex + 1).toInt()
-                val methodPassword = userInfo.split(":", limit = 2)
-                
-                return Outbound(
-                    type = "shadowsocks",
-                    tag = name,
-                    server = server,
-                    serverPort = port,
-                    method = methodPassword[0],
-                    password = methodPassword.getOrElse(1) { "" }
-                )
-            } else {
-                // 旧格式: BASE64(method:password@server:port)
-                val decoded = String(Base64.decode(mainPart, Base64.URL_SAFE or Base64.NO_PADDING))
-                val regex = Regex("(.+):(.+)@(.+):(\\d+)")
-                val match = regex.find(decoded)
-                if (match != null) {
-                    val (method, password, server, port) = match.destructured
-                    return Outbound(
-                        type = "shadowsocks",
-                        tag = name,
-                        server = server,
-                        serverPort = port.toInt(),
-                        method = method,
-                        password = password
-                    )
-                }
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-        return null
-    }
-    
-    /**
-     * 解析 WireGuard 链接
-     * 格式: wireguard://private_key@server:port?public_key=...&preshared_key=...&address=...&mtu=...#name
-     */
-    private fun parseWireGuardLink(link: String): Outbound? {
-        try {
-            val uri = java.net.URI(link)
-            val name = java.net.URLDecoder.decode(uri.fragment ?: "WireGuard Node", "UTF-8")
-            val privateKey = uri.userInfo
-            val server = uri.host
-            val port = if (uri.port > 0) uri.port else 51820
-            
-            val params = mutableMapOf<String, String>()
-            uri.query?.split("&")?.forEach { param ->
-                val parts = param.split("=", limit = 2)
-                if (parts.size == 2) {
-                    params[parts[0]] = java.net.URLDecoder.decode(parts[1], "UTF-8")
-                }
-            }
-            
-            val peerPublicKey = params["public_key"] ?: params["peer_public_key"] ?: ""
-            val preSharedKey = params["preshared_key"] ?: params["pre_shared_key"]
-            val address = params["address"] ?: params["ip"]
-            val mtu = params["mtu"]?.toIntOrNull() ?: 1420
-            val reserved = params["reserved"]?.split(",")?.mapNotNull { it.toIntOrNull() }
-            
-            val localAddresses = address?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() }
-            
-            val peer = WireGuardPeer(
-                server = server,
-                serverPort = port,
-                publicKey = peerPublicKey,
-                preSharedKey = preSharedKey,
-                allowedIps = listOf("0.0.0.0/0", "::/0"), // 默认全路由
-                reserved = reserved
-            )
-            
-            return Outbound(
-                type = "wireguard",
-                tag = name,
-                localAddress = localAddresses,
-                privateKey = privateKey,
-                peers = listOf(peer),
-                mtu = mtu
-            )
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-        return null
+        return nodeLinkParser.parse(link)
     }
 
     /**
-     * 解析 SSH 链接
-     * 格式: ssh://user:password@server:port?params#name
+     * 从配置中提取节点 - 使用协程并行处理提升性能
      */
-    private fun parseSSHLink(link: String): Outbound? {
-        try {
-            val uri = java.net.URI(link)
-            val name = java.net.URLDecoder.decode(uri.fragment ?: "SSH Node", "UTF-8")
-            val userInfo = uri.userInfo ?: ""
-            val server = uri.host
-            val port = if (uri.port > 0) uri.port else 22
-            
-            val colonIndex = userInfo.indexOf(':')
-            val user = if (colonIndex > 0) userInfo.substring(0, colonIndex) else userInfo
-            val password = if (colonIndex > 0) userInfo.substring(colonIndex + 1) else null
-            
-            val params = mutableMapOf<String, String>()
-            uri.query?.split("&")?.forEach { param ->
-                val parts = param.split("=", limit = 2)
-                if (parts.size == 2) {
-                    params[parts[0]] = java.net.URLDecoder.decode(parts[1], "UTF-8")
-                }
-            }
-            
-            val privateKey = params["private_key"]
-            val privateKeyPassphrase = params["private_key_passphrase"]
-            val hostKey = params["host_key"]?.split(",")
-            val clientVersion = params["client_version"]
-            
-            return Outbound(
-                type = "ssh",
-                tag = name,
-                server = server,
-                serverPort = port,
-                user = user,
-                password = password,
-                privateKey = privateKey,
-                privateKeyPassphrase = privateKeyPassphrase,
-                hostKey = hostKey,
-                clientVersion = clientVersion
-            )
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to parse ssh link", e)
-        }
-        return null
-    }
-
-    private fun parseVMessLink(link: String): Outbound? {
-        try {
-            val base64Part = link.removePrefix("vmess://")
-            val decoded = String(Base64.decode(base64Part, Base64.DEFAULT))
-            val json = gson.fromJson(decoded, VMessLinkConfig::class.java)
-            
-            // 如果是 WS 且开启了 TLS，但没有指定 ALPN，默认强制使用 http/1.1
-            val alpn = json.alpn?.split(",")?.filter { it.isNotBlank() }
-            val finalAlpn = if (json.tls == "tls" && json.net == "ws" && (alpn == null || alpn.isEmpty())) {
-                listOf("http/1.1")
-            } else {
-                alpn
-            }
-
-            val tlsConfig = if (json.tls == "tls") {
-                TlsConfig(
-                    enabled = true,
-                    serverName = json.sni ?: json.host ?: json.add,
-                    alpn = finalAlpn,
-                    utls = json.fp?.let { UtlsConfig(enabled = true, fingerprint = it) }
-                )
-            } else null
-            
-            val transport = when (json.net) {
-                "ws" -> {
-                    val host = json.host ?: json.sni ?: json.add
-                    val userAgent = if (json.fp?.contains("chrome") == true) {
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
-                    } else {
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0"
-                    }
-                    val headers = mutableMapOf<String, String>()
-                    if (!host.isNullOrBlank()) {
-                        headers["Host"] = host
-                    }
-                    headers["User-Agent"] = userAgent
-
-                    val rawPath = json.path ?: "/"
-                    val edMatch = Regex("""[?&]ed=(\d+)""").find(rawPath)
-                    val maxEarlyData = edMatch?.groupValues?.get(1)?.toIntOrNull() ?: 2048
-                    val cleanPath = rawPath.replace(Regex("""[?&]ed=\d+"""), "").ifEmpty { "/" }
-
-                    TransportConfig(
-                        type = "ws",
-                        path = cleanPath,
-                        headers = headers,
-                        maxEarlyData = maxEarlyData,
-                        earlyDataHeaderName = "Sec-WebSocket-Protocol"
-                    )
-                }
-                "grpc" -> TransportConfig(
-                    type = "grpc",
-                    serviceName = json.path ?: ""
-                )
-                "h2" -> TransportConfig(
-                    type = "http",
-                    host = json.host?.let { listOf(it) },
-                    path = json.path
-                )
-                "tcp" -> null
-                else -> null
-            }
-            
-            // 注意：sing-box 不支持 alter_id，只支持 AEAD 加密的 VMess (alterId=0)
-            val aid = json.aid?.toIntOrNull() ?: 0
-            if (aid != 0) {
-                Log.w(TAG, "VMess node '${json.ps}' has alterId=$aid, sing-box only supports alterId=0 (AEAD)")
-            }
-            
-            return Outbound(
-                type = "vmess",
-                tag = json.ps ?: "VMess Node",
-                server = json.add,
-                serverPort = json.port?.toIntOrNull() ?: 443,
-                uuid = json.id,
-                // alterId 已从模型中移除，sing-box 不支持
-                security = json.scy ?: "auto",
-                tls = tlsConfig,
-                transport = transport,
-                packetEncoding = json.packetEncoding?.takeIf { it.isNotBlank() }
-            )
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-        return null
-    }
-    
-    private fun parseVLessLink(link: String): Outbound? {
-        try {
-            // vless://uuid@server:port?params#name
-            val uri = java.net.URI(link)
-            val name = java.net.URLDecoder.decode(uri.fragment ?: "VLESS Node", "UTF-8")
-            val uuid = uri.userInfo
-            val server = uri.host
-            val port = if (uri.port > 0) uri.port else 443
-            
-            val params = mutableMapOf<String, String>()
-            uri.query?.split("&")?.forEach { param ->
-                val parts = param.split("=", limit = 2)
-                if (parts.size == 2) {
-                    params[parts[0]] = java.net.URLDecoder.decode(parts[1], "UTF-8")
-                }
-            }
-            
-            val security = params["security"] ?: "none"
-            val sni = params["sni"] ?: params["host"] ?: server
-            val insecure = params["allowInsecure"] == "1" || params["insecure"] == "1"
-            val alpnList = params["alpn"]?.split(",")?.filter { it.isNotBlank() }
-            val fingerprint = params["fp"]
-            val packetEncoding = params["packetEncoding"] ?: "xudp"
-            val transportType = params["type"] ?: "tcp"
-            val flow = params["flow"]?.takeIf { it.isNotBlank() }
-
-            val finalAlpnList = if (security == "tls" && transportType == "ws" && (alpnList == null || alpnList.isEmpty())) {
-                listOf("http/1.1")
-            } else {
-                alpnList
-            }
-            
-            val tlsConfig = when (security) {
-                "tls" -> TlsConfig(
-                    enabled = true,
-                    serverName = sni,
-                    insecure = insecure,
-                    alpn = finalAlpnList,
-                    utls = fingerprint?.let { UtlsConfig(enabled = true, fingerprint = it) }
-                )
-                "reality" -> TlsConfig(
-                    enabled = true,
-                    serverName = sni,
-                    insecure = insecure,
-                    alpn = finalAlpnList,
-                    reality = RealityConfig(
-                        enabled = true,
-                        publicKey = params["pbk"],
-                        shortId = params["sid"]
-                    ),
-                    utls = fingerprint?.let { UtlsConfig(enabled = true, fingerprint = it) }
-                )
-                else -> null
-            }
-            
-            val transport = when (transportType) {
-                "ws" -> {
-                    val host = params["host"] ?: sni
-                    val rawWsPath = params["path"] ?: "/"
-                    
-                    // 从路径中提取 ed 参数
-                    val earlyDataSize = params["ed"]?.toIntOrNull()
-                        ?: Regex("""(?:\?|&)ed=(\d+)""")
-                            .find(rawWsPath)
-                            ?.groupValues
-                            ?.getOrNull(1)
-                            ?.toIntOrNull()
-                    val maxEarlyData = earlyDataSize ?: 2048
-                    
-                    // 从路径中移除 ed 参数，只保留纯路径
-                    val cleanPath = rawWsPath
-                        .replace(Regex("""\?ed=\d+(&|$)"""), "")
-                        .replace(Regex("""&ed=\d+"""), "")
-                        .trimEnd('?', '&')
-                        .ifEmpty { "/" }
-                    
-                    val userAgent = if (fingerprint?.contains("chrome") == true) {
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
-                    } else {
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0"
-                    }
-                    val headers = mutableMapOf<String, String>()
-                    if (!host.isNullOrBlank()) {
-                        headers["Host"] = host
-                    }
-                    headers["User-Agent"] = userAgent
-
-                    TransportConfig(
-                        type = "ws",
-                        path = cleanPath,
-                        headers = headers,
-                        maxEarlyData = maxEarlyData,
-                        earlyDataHeaderName = "Sec-WebSocket-Protocol"
-                    )
-                }
-                "grpc" -> TransportConfig(
-                    type = "grpc",
-                    serviceName = params["serviceName"] ?: params["sn"] ?: ""
-                )
-                "http", "h2", "httpupgrade" -> TransportConfig(
-                    type = "http",
-                    path = params["path"],
-                    host = params["host"]?.let { listOf(it) }
-                )
-                "tcp" -> null
-                else -> null
-            }
-            
-            return Outbound(
-                type = "vless",
-                tag = name,
-                server = server,
-                serverPort = port,
-                uuid = uuid,
-                flow = flow,
-                tls = tlsConfig,
-                transport = transport,
-                packetEncoding = packetEncoding
-            )
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-        return null
-    }
-    
-    private fun parseTrojanLink(link: String): Outbound? {
-        try {
-            // trojan://password@server:port?params#name
-            val uri = java.net.URI(link)
-            val name = java.net.URLDecoder.decode(uri.fragment ?: "Trojan Node", "UTF-8")
-            val password = uri.userInfo
-            val server = uri.host
-            val port = if (uri.port > 0) uri.port else 443
-            
-            val params = mutableMapOf<String, String>()
-            uri.query?.split("&")?.forEach { param ->
-                val parts = param.split("=", limit = 2)
-                if (parts.size == 2) {
-                    params[parts[0]] = java.net.URLDecoder.decode(parts[1], "UTF-8")
-                }
-            }
-            
-            val sni = params["sni"] ?: server
-            val insecure = params["allowInsecure"] == "1" || params["insecure"] == "1"
-            val fingerprint = params["fp"]
-            val transportType = params["type"] ?: "tcp"
-            
-            val alpnList = params["alpn"]?.split(",")?.filter { it.isNotBlank() }
-            val finalAlpnList = if (transportType == "ws" && alpnList.isNullOrEmpty()) {
-                listOf("http/1.1")
-            } else {
-                alpnList
-            }
-            
-            val transport = when (transportType) {
-                "ws" -> {
-                    val wsHost = params["host"] ?: sni
-                    val rawPath = params["path"] ?: "/"
-                    val edMatch = Regex("""[?&]ed=(\d+)""").find(rawPath)
-                    val maxEarlyData = params["ed"]?.toIntOrNull() ?: edMatch?.groupValues?.get(1)?.toIntOrNull() ?: 2048
-                    val cleanPath = rawPath.replace(Regex("""[?&]ed=\d+"""), "").ifEmpty { "/" }
-                    
-                    val ua = if (fingerprint?.contains("chrome", true) == true) {
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
-                    } else {
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0"
-                    }
-                    
-                    TransportConfig(
-                        type = "ws",
-                        path = cleanPath,
-                        headers = mapOf("Host" to wsHost, "User-Agent" to ua),
-                        maxEarlyData = maxEarlyData,
-                        earlyDataHeaderName = "Sec-WebSocket-Protocol"
-                    )
-                }
-                "grpc" -> TransportConfig(type = "grpc", serviceName = params["serviceName"] ?: "")
-                else -> null
-            }
-            
-            return Outbound(
-                type = "trojan",
-                tag = name,
-                server = server,
-                serverPort = port,
-                password = password,
-                tls = TlsConfig(
-                    enabled = true,
-                    serverName = sni,
-                    insecure = insecure,
-                    alpn = finalAlpnList,
-                    utls = fingerprint?.let { UtlsConfig(enabled = true, fingerprint = it) }
-                ),
-                transport = transport
-            )
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to parse trojan link", e)
-        }
-        return null
-    }
-    
-    private fun parseHysteria2Link(link: String): Outbound? {
-        try {
-            // hysteria2://password@server:port?params#name
-            val uri = java.net.URI(link.replace("hy2://", "hysteria2://"))
-            val name = java.net.URLDecoder.decode(uri.fragment ?: "Hysteria2 Node", "UTF-8")
-            val password = uri.userInfo
-            val server = uri.host
-            val port = if (uri.port == -1) 443 else uri.port
-            
-            val params = mutableMapOf<String, String>()
-            uri.query?.split("&")?.forEach { param ->
-                val parts = param.split("=", limit = 2)
-                if (parts.size == 2) {
-                    params[parts[0]] = java.net.URLDecoder.decode(parts[1], "UTF-8")
-                }
-            }
-            
-            return Outbound(
-                type = "hysteria2",
-                tag = name,
-                server = server,
-                serverPort = port,
-                password = password,
-                tls = TlsConfig(
-                    enabled = true,
-                    serverName = params["sni"] ?: server,
-                    insecure = params["insecure"] == "1"
-                ),
-                obfs = params["obfs"]?.let { obfsType ->
-                    ObfsConfig(
-                        type = obfsType,
-                        password = params["obfs-password"]
-                    )
-                }
-            )
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to parse hysteria2 link", e)
-        }
-        return null
-    }
-    
-    private fun parseHysteriaLink(link: String): Outbound? {
-        try {
-            val uri = java.net.URI(link)
-            val name = java.net.URLDecoder.decode(uri.fragment ?: "Hysteria Node", "UTF-8")
-            val server = uri.host
-            val port = if (uri.port == -1) 443 else uri.port
-            
-            val params = mutableMapOf<String, String>()
-            uri.query?.split("&")?.forEach { param ->
-                val parts = param.split("=", limit = 2)
-                if (parts.size == 2) {
-                    params[parts[0]] = java.net.URLDecoder.decode(parts[1], "UTF-8")
-                }
-            }
-            
-            return Outbound(
-                type = "hysteria",
-                tag = name,
-                server = server,
-                serverPort = port,
-                authStr = params["auth"],
-                upMbps = params["upmbps"]?.toIntOrNull(),
-                downMbps = params["downmbps"]?.toIntOrNull(),
-                tls = TlsConfig(
-                    enabled = true,
-                    serverName = params["sni"] ?: server,
-                    insecure = params["insecure"] == "1",
-                    alpn = params["alpn"]?.split(",")
-                ),
-                obfs = params["obfs"]?.let { ObfsConfig(type = it) }
-            )
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to parse hysteria link", e)
-        }
-        return null
-    }
-    
-    /**
-     * 解析 AnyTLS 链接
-     * 格式: anytls://password@server:port?params#name
-     */
-    private fun parseAnyTLSLink(link: String): Outbound? {
-        try {
-            val uri = java.net.URI(link)
-            val name = java.net.URLDecoder.decode(uri.fragment ?: "AnyTLS Node", "UTF-8")
-            val password = uri.userInfo
-            val server = uri.host
-            val port = if (uri.port > 0) uri.port else 443
-            
-            val params = mutableMapOf<String, String>()
-            uri.query?.split("&")?.forEach { param ->
-                val parts = param.split("=", limit = 2)
-                if (parts.size == 2) {
-                    try {
-                        params[parts[0]] = java.net.URLDecoder.decode(parts[1], "UTF-8")
-                    } catch (e: Exception) {
-                        params[parts[0]] = parts[1]
-                    }
-                }
-            }
-            
-            val sni = params["sni"] ?: server
-            val insecure = params["insecure"] == "1" || params["allowInsecure"] == "1"
-            val alpnList = params["alpn"]?.split(",")?.filter { it.isNotBlank() }
-            val fingerprint = params["fp"]?.takeIf { it.isNotBlank() }
-            
-            return Outbound(
-                type = "anytls",
-                tag = name,
-                server = server,
-                serverPort = port,
-                password = password,
-                tls = TlsConfig(
-                    enabled = true,
-                    serverName = sni,
-                    insecure = insecure,
-                    alpn = alpnList,
-                    utls = fingerprint?.let { UtlsConfig(enabled = true, fingerprint = it) }
-                ),
-                idleSessionCheckInterval = params["idle_session_check_interval"],
-                idleSessionTimeout = params["idle_session_timeout"],
-                minIdleSession = params["min_idle_session"]?.toIntOrNull()
-            )
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-        return null
-    }
-    
-    /**
-     * 解析 TUIC 链接
-     * 格式: tuic://uuid:password@server:port?params#name
-     */
-    private fun parseTuicLink(link: String): Outbound? {
-        try {
-            val uri = java.net.URI(link)
-            val name = java.net.URLDecoder.decode(uri.fragment ?: "TUIC Node", "UTF-8")
-            val server = uri.host
-            val port = if (uri.port > 0) uri.port else 443
-            
-            // 解析 userInfo: uuid:password
-            val userInfo = uri.userInfo ?: ""
-            val colonIndex = userInfo.indexOf(':')
-            val uuid = if (colonIndex > 0) userInfo.substring(0, colonIndex) else userInfo
-            var password = if (colonIndex > 0) userInfo.substring(colonIndex + 1) else ""
-            
-            val params = mutableMapOf<String, String>()
-            uri.query?.split("&")?.forEach { param ->
-                val parts = param.split("=", limit = 2)
-                if (parts.size == 2) {
-                    try {
-                        params[parts[0]] = java.net.URLDecoder.decode(parts[1], "UTF-8")
-                    } catch (e: Exception) {
-                        params[parts[0]] = parts[1]
-                    }
-                }
-            }
-            
-            // 如果 password 为空，尝试从 query 参数中获取，或使用 UUID 作为密码
-            if (password.isBlank()) {
-                password = params["password"] ?: params["token"] ?: uuid
-            }
-            
-            val sni = params["sni"] ?: server
-            val insecure = params["allow_insecure"] == "1" || params["allowInsecure"] == "1" || params["insecure"] == "1"
-            val alpnList = params["alpn"]?.split(",")?.filter { it.isNotBlank() }
-            val fingerprint = params["fp"]?.takeIf { it.isNotBlank() }
-            
-            return Outbound(
-                type = "tuic",
-                tag = name,
-                server = server,
-                serverPort = port,
-                uuid = uuid,
-                password = password,
-                congestionControl = params["congestion_control"] ?: params["congestion"] ?: "bbr",
-                udpRelayMode = params["udp_relay_mode"] ?: "native",
-                zeroRttHandshake = params["reduce_rtt"] == "1" || params["zero_rtt"] == "1",
-                tls = TlsConfig(
-                    enabled = true,
-                    serverName = sni,
-                    insecure = insecure,
-                    alpn = alpnList,
-                    utls = fingerprint?.let { UtlsConfig(enabled = true, fingerprint = it) }
-                )
-            )
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-        return null
-    }
-    
-    /**
-     * 从配置中提取节点
-     */
-    private fun extractNodesFromConfig(
+    private suspend fun extractNodesFromConfig(
         config: SingBoxConfig,
         profileId: String,
         onProgress: ((String) -> Unit)? = null
-    ): List<NodeUi> {
-        val nodes = mutableListOf<NodeUi>()
-        val outbounds = config.outbounds ?: return nodes
+    ): List<NodeUi> = withContext(Dispatchers.Default) {
+        val outbounds = config.outbounds ?: return@withContext emptyList()
         val trafficRepo = TrafficRepository.getInstance(context)
 
         // 收集所有 selector 和 urltest 的 outbounds 作为分组
-        val groupOutbounds = outbounds.filter { 
-            it.type == "selector" || it.type == "urltest" 
+        val groupOutbounds = outbounds.filter {
+            it.type == "selector" || it.type == "urltest"
         }
-        
+
         // 创建节点到分组的映射
         val nodeToGroup = mutableMapOf<String, String>()
         groupOutbounds.forEach { group ->
@@ -1725,7 +1287,7 @@ class ConfigRepository(private val context: Context) {
                 nodeToGroup[nodeName] = group.tag
             }
         }
-        
+
         // 过滤出代理节点
         val proxyTypes = setOf(
             "shadowsocks", "vmess", "vless", "trojan",
@@ -1733,84 +1295,101 @@ class ConfigRepository(private val context: Context) {
             "shadowtls", "ssh", "anytls", "http", "socks"
         )
 
-        var processedCount = 0
-        val totalCount = outbounds.size
-        
-        for (outbound in outbounds) {
-            processedCount++
-            // 每处理50个节点回调一次进度
-            if (processedCount % 50 == 0) {
-                onProgress?.invoke(context.getString(R.string.profiles_extracting_nodes, processedCount, totalCount))
-            }
+        // 收集所有被其他 outbound 作为 detour 引用的 tag（这些是辅助 outbound，不应显示为独立节点）
+        val detourTags = outbounds.mapNotNull { it.detour }.toSet()
 
-            if (outbound.type in proxyTypes) {
-                var group = nodeToGroup[outbound.tag] ?: "Default"
-                
-                // 校验分组名是否为有效名称 (避免链接被当作分组名)
-                if (group.contains("://") || group.length > 50) {
-                    group = "未分组"
+        val validOutbounds = outbounds.filter { 
+            it.type in proxyTypes && it.tag !in detourTags
+        }
+        if (validOutbounds.isEmpty()) return@withContext emptyList()
+
+        val total = validOutbounds.size
+        val completed = AtomicInteger(0)
+        val semaphore = Semaphore(PARALLEL_CONCURRENCY)
+
+        val deferredNodes = validOutbounds.map { outbound ->
+            async {
+                semaphore.withPermit {
+                    val node = createNodeUi(outbound, profileId, nodeToGroup, trafficRepo)
+                    val done = completed.incrementAndGet()
+                    if (done % 100 == 0 || done == total) {
+                        onProgress?.invoke(context.getString(R.string.profiles_extracting_nodes, done, total))
+                    }
+                    node
                 }
-
-                var regionFlag = detectRegionFlag(outbound.tag)
-                
-                // 如果从名称无法识别地区，尝试更深层次的信息挖掘
-                if (regionFlag == "🌐" || regionFlag.isBlank()) {
-                    // 1. 尝试 SNI (通常 CDN 节点会使用 SNI 指向真实域名)
-                    val sni = outbound.tls?.serverName
-                    if (!sni.isNullOrBlank()) {
-                        val sniRegion = detectRegionFlag(sni)
-                        if (sniRegion != "🌐" && sniRegion.isNotBlank()) regionFlag = sniRegion
-                    }
-                    
-                    // 2. 尝试 Host (WS/HTTP Host)
-                    if ((regionFlag == "🌐" || regionFlag.isBlank())) {
-                        val host = outbound.transport?.headers?.get("Host")
-                            ?: outbound.transport?.host?.firstOrNull()
-                        if (!host.isNullOrBlank()) {
-                            val hostRegion = detectRegionFlag(host)
-                            if (hostRegion != "🌐" && hostRegion.isNotBlank()) regionFlag = hostRegion
-                        }
-                    }
-
-                    // 3. 最后尝试服务器地址 (可能是 CDN IP，准确度较低，作为兜底)
-                    if ((regionFlag == "🌐" || regionFlag.isBlank()) && !outbound.server.isNullOrBlank()) {
-                        val serverRegion = detectRegionFlag(outbound.server)
-                        if (serverRegion != "🌐" && serverRegion.isNotBlank()) regionFlag = serverRegion
-                    }
-                }
-                
-                // 2025-fix: 始终设置 regionFlag 以确保排序功能正常工作
-                // UI 层 (NodeCard) 将负责检查名称中是否已包含该国旗，从而避免重复显示
-                val finalRegionFlag = regionFlag
-
-                // 2025 规范：确保 tag 已经应用了协议后缀（在 SubscriptionManager 中处理过了）
-                // 这里我们只需确保 NodeUi 能够正确显示国旗
-                
-                val id = stableNodeId(profileId, outbound.tag)
-                nodes.add(
-                    NodeUi(
-                        id = id,
-                        name = outbound.tag,
-                        protocol = outbound.type,
-                        group = group,
-                        regionFlag = finalRegionFlag,
-                        latencyMs = null,
-                        isFavorite = false,
-                        sourceProfileId = profileId,
-                        trafficUsed = trafficRepo.getMonthlyTotal(id),
-                        tags = buildList {
-                            outbound.tls?.let {
-                                if (it.enabled == true) add("TLS")
-                                it.reality?.let { r -> if (r.enabled == true) add("Reality") }
-                            }
-                            outbound.transport?.type?.let { add(it.uppercase()) }
-                        }
-                    )
-                )
             }
         }
-        
-        return nodes
+
+        deferredNodes.awaitAll().filterNotNull()
+    }
+
+    /**
+     * 创建单个节点 UI 对象
+     */
+    private fun createNodeUi(
+        outbound: Outbound,
+        profileId: String,
+        nodeToGroup: Map<String, String>,
+        trafficRepo: TrafficRepository
+    ): NodeUi? {
+        if (outbound.tag.isBlank()) return null
+
+        var group = nodeToGroup[outbound.tag] ?: "Default"
+
+        // 校验分组名是否为有效名称 (避免链接被当作分组名)
+        if (group.contains("://") || group.length > 50) {
+            group = "未分组"
+        }
+
+        var regionFlag = detectRegionFlag(outbound.tag)
+
+        // 如果从名称无法识别地区，尝试更深层次的信息挖掘
+        if (regionFlag == "🌐" || regionFlag.isBlank()) {
+            // 1. 尝试 SNI (通常 CDN 节点会使用 SNI 指向真实域名)
+            val sni = outbound.tls?.serverName
+            if (!sni.isNullOrBlank()) {
+                val sniRegion = detectRegionFlag(sni)
+                if (sniRegion != "🌐" && sniRegion.isNotBlank()) regionFlag = sniRegion
+            }
+
+            // 2. 尝试 Host (WS/HTTP Host)
+            if ((regionFlag == "🌐" || regionFlag.isBlank())) {
+                val host = outbound.transport?.headers?.get("Host")
+                    ?: outbound.transport?.host?.firstOrNull()
+                if (!host.isNullOrBlank()) {
+                    val hostRegion = detectRegionFlag(host)
+                    if (hostRegion != "🌐" && hostRegion.isNotBlank()) regionFlag = hostRegion
+                }
+            }
+
+            // 3. 最后尝试服务器地址 (可能是 CDN IP，准确度较低，作为兜底)
+            if ((regionFlag == "🌐" || regionFlag.isBlank()) && !outbound.server.isNullOrBlank()) {
+                val serverRegion = detectRegionFlag(outbound.server)
+                if (serverRegion != "🌐" && serverRegion.isNotBlank()) regionFlag = serverRegion
+            }
+        }
+
+        val finalRegionFlag = regionFlag
+        val id = stableNodeId(profileId, outbound.tag)
+
+        return NodeUi(
+            id = id,
+            name = outbound.tag,
+            protocol = outbound.type,
+            group = group,
+            regionFlag = finalRegionFlag,
+            latencyMs = null,
+            isFavorite = false,
+            sourceProfileId = profileId,
+            trafficUsed = trafficRepo.getMonthlyTotal(id),
+            tags = buildList {
+                outbound.tls?.let {
+                    if (it.enabled == true) add("TLS")
+                    it.reality?.let { r -> if (r.enabled == true) add("Reality") }
+                }
+                outbound.transport?.type?.let { add(it.uppercase()) }
+            }
+        )
     }
     
     /**
@@ -1823,61 +1402,44 @@ class ConfigRepository(private val context: Context) {
         // U+1F1E6 是 \uD83C\uDDE6
         // U+1F1FF 是 \uD83C\uDDFF
         // 正则表达式匹配两个连续的区域指示符
-        val regex = Regex("[\\uD83C][\\uDDE6-\\uDDFF][\\uD83C][\\uDDE6-\\uDDFF]")
-        
-        // 另外，有些国旗 Emoji 可能不在这个范围内，或者已经被渲染为 Emoji
-        // 我们也可以尝试匹配常见的国旗 Emoji 字符范围
-        // 或者简单地，如果字符串包含任何 Emoji，我们可能都需要谨慎
-        // 但目前先专注于国旗
-        
-        return regex.containsMatchIn(str)
+        return REGEX_FLAG_EMOJI.containsMatchIn(str)
     }
 
     /**
      * 根据节点名称检测地区标志
-
-     * 使用词边界匹配，避免 "us" 匹配 "music" 等误报
+     *
+     * 使用预编译规则和缓存优化性能
      */
     private fun detectRegionFlag(name: String): String {
+        // 先查缓存
+        regionFlagCache[name]?.let { return it }
+
         val lowerName = name.lowercase()
-        
-        fun matchWord(vararg words: String): Boolean {
-            return words.any { word ->
-                val regex = Regex("(^|[^a-z])${Regex.escape(word)}([^a-z]|$)")
-                regex.containsMatchIn(lowerName)
+
+        for (rule in REGION_RULES) {
+            // 1. 检查中文关键词 (直接 contains)
+            if (rule.chineseKeywords.any { lowerName.contains(it) }) {
+                regionFlagCache[name] = rule.flag
+                return rule.flag
+            }
+
+            // 2. 检查英文关键词 (直接 contains)
+            if (rule.englishKeywords.any { lowerName.contains(it) }) {
+                regionFlagCache[name] = rule.flag
+                return rule.flag
+            }
+
+            // 3. 检查需要词边界的短代码 (使用预编译 Regex)
+            if (rule.wordBoundaryKeywords.any { word ->
+                WORD_BOUNDARY_REGEX_MAP[word]?.containsMatchIn(lowerName) == true
+            }) {
+                regionFlagCache[name] = rule.flag
+                return rule.flag
             }
         }
-        
-        return when {
-            lowerName.contains("香港") || matchWord("hk") || lowerName.contains("hong kong") -> "🇭🇰"
-            lowerName.contains("台湾") || matchWord("tw") || lowerName.contains("taiwan") -> "🇹🇼"
-            lowerName.contains("日本") || matchWord("jp") || lowerName.contains("japan") || lowerName.contains("tokyo") -> "🇯🇵"
-            lowerName.contains("新加坡") || matchWord("sg") || lowerName.contains("singapore") -> "🇸🇬"
-            lowerName.contains("美国") || matchWord("us", "usa") || lowerName.contains("united states") || lowerName.contains("america") -> "🇺🇸"
-            lowerName.contains("韩国") || matchWord("kr") || lowerName.contains("korea") -> "🇰🇷"
-            lowerName.contains("英国") || matchWord("uk", "gb") || lowerName.contains("britain") || lowerName.contains("england") -> "🇬🇧"
-            lowerName.contains("德国") || matchWord("de") || lowerName.contains("germany") -> "🇩🇪"
-            lowerName.contains("法国") || matchWord("fr") || lowerName.contains("france") -> "🇫🇷"
-            lowerName.contains("加拿大") || matchWord("ca") || lowerName.contains("canada") -> "🇨🇦"
-            lowerName.contains("澳大利亚") || matchWord("au") || lowerName.contains("australia") -> "🇦🇺"
-            lowerName.contains("俄罗斯") || matchWord("ru") || lowerName.contains("russia") -> "🇷🇺"
-            lowerName.contains("印度") || matchWord("in") || lowerName.contains("india") -> "🇮🇳"
-            lowerName.contains("巴西") || matchWord("br") || lowerName.contains("brazil") -> "🇧🇷"
-            lowerName.contains("荷兰") || matchWord("nl") || lowerName.contains("netherlands") -> "🇳🇱"
-            lowerName.contains("土耳其") || matchWord("tr") || lowerName.contains("turkey") -> "🇹🇷"
-            lowerName.contains("阿根廷") || matchWord("ar") || lowerName.contains("argentina") -> "🇦🇷"
-            lowerName.contains("马来西亚") || matchWord("my") || lowerName.contains("malaysia") -> "🇲🇾"
-            lowerName.contains("泰国") || matchWord("th") || lowerName.contains("thailand") -> "🇹🇭"
-            lowerName.contains("越南") || matchWord("vn") || lowerName.contains("vietnam") -> "🇻🇳"
-            lowerName.contains("菲律宾") || matchWord("ph") || lowerName.contains("philippines") -> "🇵🇭"
-            lowerName.contains("印尼") || matchWord("id") || lowerName.contains("indonesia") -> "🇮🇩"
-            else -> "🌐"
-        }
-    }
-    
-    private fun updateNodeGroups(nodes: List<NodeUi>) {
-        val groups = nodes.map { it.group }.distinct().sorted()
-        _nodeGroups.value = listOf("全部") + groups
+
+        regionFlagCache[name] = "🌐"
+        return "🌐"
     }
     
     fun setActiveProfile(profileId: String, targetNodeId: String? = null) {
@@ -1886,7 +1448,6 @@ class ConfigRepository(private val context: Context) {
 
         fun updateState(nodes: List<NodeUi>) {
             _nodes.value = nodes
-            updateNodeGroups(nodes)
 
             val currentActiveId = _activeNodeId.value
 
@@ -1913,7 +1474,6 @@ class ConfigRepository(private val context: Context) {
             updateState(cached)
         } else {
             _nodes.value = emptyList()
-            _nodeGroups.value = listOf("全部")
             scope.launch {
                 val cfg = loadConfig(profileId) ?: return@launch
                 val nodes = extractNodesFromConfig(cfg, profileId)
@@ -2044,7 +1604,7 @@ class ConfigRepository(private val context: Context) {
                 lastRunProfileId = currentProfileId
 
 
-                val coreMode = VpnStateStore.getMode(context)
+                val coreMode = VpnStateStore.getMode()
 
                 // ⭐ 2025-fix: 跨配置切换预清理机制
                 // 如果需要重启 VPN (tagsChanged=true)，先发送预清理信号让 Service 关闭现有连接
@@ -2147,7 +1707,6 @@ class ConfigRepository(private val context: Context) {
                 setActiveProfile(newActiveId)
             } else {
                 _nodes.value = emptyList()
-                _nodeGroups.value = listOf("全部")
                 _activeNodeId.value = null
             }
         }
@@ -2218,7 +1777,9 @@ class ConfigRepository(private val context: Context) {
                     }
 
                     val fixedOutbound = buildOutboundForRuntime(outbound)
-                    val latency = singBoxCore.testOutboundLatency(fixedOutbound)
+                    // 传入完整的 outbounds 列表，用于解析依赖（如 SS+ShadowTLS）
+                    val allOutbounds = config.outbounds?.map { buildOutboundForRuntime(it) } ?: emptyList()
+                    val latency = singBoxCore.testOutboundLatency(fixedOutbound, allOutbounds)
 
                     _nodes.update { list ->
                         list.map {
@@ -2260,10 +1821,13 @@ class ConfigRepository(private val context: Context) {
      * 使用并发方式提高效率
      */
     suspend fun clearAllNodesLatency() = withContext(Dispatchers.IO) {
+        // 清除已保存的延时数据
+        savedNodeLatencies.clear()
+
         _nodes.update { list ->
             list.map { it.copy(latencyMs = null) }
         }
-        
+
         // Update profileNodes map
         profileNodes.keys.forEach { profileId ->
             profileNodes[profileId] = profileNodes[profileId]?.map {
@@ -2325,21 +1889,24 @@ class ConfigRepository(private val context: Context) {
         saveProfiles()
     }
 
-    suspend fun updateAllProfiles(): BatchUpdateResult {
+    suspend fun updateAllProfiles(): BatchUpdateResult = withContext(Dispatchers.IO) {
         val enabledProfiles = _profiles.value.filter { it.enabled && it.type == ProfileType.Subscription }
-        
+
         if (enabledProfiles.isEmpty()) {
-            return BatchUpdateResult()
+            return@withContext BatchUpdateResult()
         }
-        
-        val results = mutableListOf<SubscriptionUpdateResult>()
-        
-        enabledProfiles.forEach { profile ->
-            val result = updateProfile(profile.id)
-            results.add(result)
-        }
-        
-        return BatchUpdateResult(
+
+        // 并行更新所有订阅，限制并发数为 3
+        val semaphore = Semaphore(3)
+        val results = enabledProfiles.map { profile ->
+            async {
+                semaphore.withPermit {
+                    updateProfile(profile.id)
+                }
+            }
+        }.awaitAll()
+
+        BatchUpdateResult(
             successWithChanges = results.count { it is SubscriptionUpdateResult.SuccessWithChanges },
             successNoChanges = results.count { it is SubscriptionUpdateResult.SuccessNoChanges },
             failed = results.count { it is SubscriptionUpdateResult.Failed },
@@ -2431,9 +1998,8 @@ class ConfigRepository(private val context: Context) {
             // 如果是当前活跃配置，更新节点列表
             if (_activeProfileId.value == profile.id) {
                 _nodes.value = newNodes
-                updateNodeGroups(newNodes)
             }
-            
+
             // 更新用户信息
             _profiles.update { list ->
                 list.map {
@@ -2505,11 +2071,6 @@ class ConfigRepository(private val context: Context) {
             val outboundsContext = buildRunOutbounds(config, activeNode, settings, allNodesSnapshot)
             val route = buildRunRoute(settings, outboundsContext.selectorTag, outboundsContext.outbounds, outboundsContext.nodeTagResolver, customRuleSets)
 
-            // 合并自定义配置
-            val mergedOutbounds = mergeCustomOutbounds(outboundsContext.outbounds, settings.customOutboundsJson)
-            val mergedRoute = mergeCustomRouteRules(route, settings.customRouteRulesJson)
-            val mergedDns = mergeCustomDnsRules(dns, settings.customDnsRulesJson)
-
             lastTagToNodeName = outboundsContext.nodeTagMap.mapNotNull { (nodeId, tag) ->
                 val name = allNodesSnapshot.firstOrNull { it.id == nodeId }?.name
                 if (name.isNullOrBlank() || tag.isBlank()) null else (tag to name)
@@ -2519,9 +2080,9 @@ class ConfigRepository(private val context: Context) {
                 log = log,
                 experimental = experimental,
                 inbounds = inbounds,
-                dns = mergedDns,
-                route = mergedRoute,
-                outbounds = mergedOutbounds
+                dns = dns,
+                route = route,
+                outbounds = outboundsContext.outbounds
             )
 
             val validation = singBoxCore.validateConfig(runConfig)
@@ -2561,319 +2122,13 @@ class ConfigRepository(private val context: Context) {
             null
         }
     }
-    
+
     /**
-     * 运行时修复 Outbound 配置
-     * 包括：修复 interval 单位、清理 flow、补充 ALPN、补充 User-Agent、补充缺省值
+     * 运行时修复 Outbound 配置 - 委托给 OutboundFixer
      */
-    private fun fixOutboundForRuntime(outbound: Outbound): Outbound {
-        var result = outbound
+    private fun fixOutboundForRuntime(outbound: Outbound): Outbound = OutboundFixer.fix(outbound)
 
-        val interval = result.interval
-        if (interval != null) {
-            val fixedInterval = when {
-                interval.matches(Regex("^\\d+$")) -> "${interval}s"
-                interval.matches(Regex("^\\d+\\.\\d+$")) -> "${interval}s"
-                interval.matches(Regex("^\\d+[smhd]$", RegexOption.IGNORE_CASE)) -> interval.lowercase()
-                else -> interval
-            }
-            if (fixedInterval != interval) {
-                result = result.copy(interval = fixedInterval)
-            }
-        }
-
-        // Fix flow
-        val cleanedFlow = result.flow?.takeIf { it.isNotBlank() }
-        val normalizedFlow = cleanedFlow?.let { flowValue ->
-            if (flowValue.contains("xtls-rprx-vision")) {
-                "xtls-rprx-vision"
-            } else {
-                flowValue
-            }
-        }
-        if (normalizedFlow != result.flow) {
-            result = result.copy(flow = normalizedFlow)
-        }
-
-        // Fix URLTest - Convert to selector to avoid sing-box core panic during InterfaceUpdated
-        // The urltest implementation in some sing-box versions has race condition issues
-        if (result.type == "urltest" || result.type == "url-test") {
-            var newOutbounds = result.outbounds
-            if (newOutbounds.isNullOrEmpty()) {
-                newOutbounds = listOf("direct")
-            }
-            
-            // Convert urltest to selector to avoid crash
-            result = result.copy(
-                type = "selector",
-                outbounds = newOutbounds,
-                default = newOutbounds.firstOrNull(),
-                interruptExistConnections = false,
-                // Clear urltest-specific fields
-                url = null,
-                interval = null,
-                tolerance = null
-            )
-        }
-        
-        // Fix Selector empty outbounds
-        if (result.type == "selector" && result.outbounds.isNullOrEmpty()) {
-            result = result.copy(outbounds = listOf("direct"))
-        }
-
-        fun isIpLiteral(value: String): Boolean {
-            val v = value.trim()
-            if (v.isEmpty()) return false
-            val ipv4 = Regex("^(?:\\d{1,3}\\.){3}\\d{1,3}$")
-            if (ipv4.matches(v)) {
-                return v.split(".").all { it.toIntOrNull()?.let { n -> n in 0..255 } == true }
-            }
-            val ipv6 = Regex("^[0-9a-fA-F:]+$")
-            return v.contains(":") && ipv6.matches(v)
-        }
-
-        val tls = result.tls
-        val transport = result.transport
-        if (transport?.type == "ws" && tls?.enabled == true) {
-            val wsHost = transport.headers?.get("Host")
-                ?: transport.headers?.get("host")
-                ?: transport.host?.firstOrNull()
-            val sni = tls.serverName?.trim().orEmpty()
-            val server = result.server?.trim().orEmpty()
-            if (!wsHost.isNullOrBlank() && !isIpLiteral(wsHost)) {
-                val needFix = sni.isBlank() || isIpLiteral(sni) || (server.isNotBlank() && sni.equals(server, ignoreCase = true))
-                if (needFix && !wsHost.equals(sni, ignoreCase = true)) {
-                    result = result.copy(tls = tls.copy(serverName = wsHost))
-                }
-            }
-        }
-
-        val tlsAfterSni = result.tls
-        if (result.transport?.type == "ws" && tlsAfterSni?.enabled == true && (tlsAfterSni.alpn == null || tlsAfterSni.alpn.isEmpty())) {
-            result = result.copy(tls = tlsAfterSni.copy(alpn = listOf("http/1.1")))
-        }
-
-        // Fix User-Agent and path for WS
-        if (transport != null && transport.type == "ws") {
-            val headers = transport.headers?.toMutableMap() ?: mutableMapOf()
-            var needUpdate = false
-            
-            // 如果没有 Host，尝试从 SNI 或 Server 获取
-            if (!headers.containsKey("Host")) {
-                val host = transport.host?.firstOrNull()
-                    ?: result.tls?.serverName
-                    ?: result.server
-                if (!host.isNullOrBlank()) {
-                    headers["Host"] = host
-                    needUpdate = true
-                }
-            }
-            
-            // 补充 User-Agent
-            if (!headers.containsKey("User-Agent")) {
-                val fingerprint = result.tls?.utls?.fingerprint
-                val userAgent = if (fingerprint?.contains("chrome") == true) {
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
-                } else {
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0"
-                }
-                headers["User-Agent"] = userAgent
-                needUpdate = true
-            }
-            
-            // 清理路径中的 ed 参数
-            val rawPath = transport.path ?: "/"
-            val cleanPath = rawPath
-                .replace(Regex("""\?ed=\d+(&|$)"""), "")
-                .replace(Regex("""&ed=\d+"""), "")
-                .trimEnd('?', '&')
-                .ifEmpty { "/" }
-            
-            val pathChanged = cleanPath != rawPath
-            
-            if (needUpdate || pathChanged) {
-                result = result.copy(transport = transport.copy(
-                    headers = headers,
-                    path = cleanPath
-                ))
-            }
-        }
-
-        // 强制清理 VLESS 协议中的 security 字段 (sing-box 不支持)
-        if (result.type == "vless" && result.security != null) {
-            result = result.copy(security = null)
-        }
-
-        // Hysteria/Hysteria2: some sing-box/libbox builds require up_mbps/down_mbps to be present.
-        // If missing, the core may fail to establish connections and the local proxy test will see Connection reset.
-        if (result.type == "hysteria" || result.type == "hysteria2") {
-            val up = result.upMbps
-            val down = result.downMbps
-            val defaultMbps = 50
-            if (up == null || down == null) {
-                result = result.copy(
-                    upMbps = up ?: defaultMbps,
-                    downMbps = down ?: defaultMbps
-                )
-            }
-        }
-
-        // 补齐 VMess packetEncoding 缺省值
-        if (result.type == "vmess" && result.packetEncoding.isNullOrBlank()) {
-            result = result.copy(packetEncoding = "xudp")
-        }
-
-        return result
-    }
-
-    private fun buildOutboundForRuntime(outbound: Outbound): Outbound {
-        val fixed = fixOutboundForRuntime(outbound)
-        return when (fixed.type) {
-            "selector", "urltest", "url-test" -> Outbound(
-                type = "selector",
-                tag = fixed.tag,
-                outbounds = fixed.outbounds,
-                default = fixed.default,
-                interruptExistConnections = fixed.interruptExistConnections
-            )
-
-            "direct", "block", "dns" -> Outbound(type = fixed.type, tag = fixed.tag)
-
-            "vmess" -> Outbound(
-                type = fixed.type,
-                tag = fixed.tag,
-                server = fixed.server,
-                serverPort = fixed.serverPort,
-                uuid = fixed.uuid,
-                security = fixed.security,
-                packetEncoding = fixed.packetEncoding,
-                tls = fixed.tls,
-                transport = fixed.transport,
-                multiplex = fixed.multiplex
-            )
-
-            "vless" -> Outbound(
-                type = fixed.type,
-                tag = fixed.tag,
-                server = fixed.server,
-                serverPort = fixed.serverPort,
-                uuid = fixed.uuid,
-                flow = fixed.flow,
-                packetEncoding = fixed.packetEncoding,
-                tls = fixed.tls,
-                transport = fixed.transport,
-                multiplex = fixed.multiplex
-            )
-
-            "trojan" -> Outbound(
-                type = fixed.type,
-                tag = fixed.tag,
-                server = fixed.server,
-                serverPort = fixed.serverPort,
-                password = fixed.password,
-                tls = fixed.tls,
-                transport = fixed.transport,
-                multiplex = fixed.multiplex
-            )
-
-            "shadowsocks" -> Outbound(
-                type = fixed.type,
-                tag = fixed.tag,
-                server = fixed.server,
-                serverPort = fixed.serverPort,
-                method = fixed.method,
-                password = fixed.password,
-                plugin = fixed.plugin,
-                pluginOpts = fixed.pluginOpts,
-                udpOverTcp = fixed.udpOverTcp,
-                multiplex = fixed.multiplex
-            )
-
-            "hysteria", "hysteria2" -> Outbound(
-                type = fixed.type,
-                tag = fixed.tag,
-                server = fixed.server,
-                serverPort = fixed.serverPort,
-                password = fixed.password,
-                authStr = fixed.authStr,
-                upMbps = fixed.upMbps,
-                downMbps = fixed.downMbps,
-                obfs = fixed.obfs,
-                recvWindowConn = fixed.recvWindowConn,
-                recvWindow = fixed.recvWindow,
-                disableMtuDiscovery = fixed.disableMtuDiscovery,
-                hopInterval = fixed.hopInterval,
-                ports = fixed.ports,
-                tls = fixed.tls,
-                multiplex = fixed.multiplex
-            )
-
-            "tuic" -> Outbound(
-                type = fixed.type,
-                tag = fixed.tag,
-                server = fixed.server,
-                serverPort = fixed.serverPort,
-                uuid = fixed.uuid,
-                password = fixed.password,
-                congestionControl = fixed.congestionControl,
-                udpRelayMode = fixed.udpRelayMode,
-                zeroRttHandshake = fixed.zeroRttHandshake,
-                heartbeat = fixed.heartbeat,
-                disableSni = fixed.disableSni,
-                mtu = fixed.mtu,
-                tls = fixed.tls,
-                multiplex = fixed.multiplex
-            )
-
-            "anytls" -> Outbound(
-                type = fixed.type,
-                tag = fixed.tag,
-                server = fixed.server,
-                serverPort = fixed.serverPort,
-                password = fixed.password,
-                idleSessionCheckInterval = fixed.idleSessionCheckInterval,
-                idleSessionTimeout = fixed.idleSessionTimeout,
-                minIdleSession = fixed.minIdleSession,
-                tls = fixed.tls,
-                multiplex = fixed.multiplex
-            )
-
-            "wireguard" -> Outbound(
-                type = fixed.type,
-                tag = fixed.tag,
-                localAddress = fixed.localAddress,
-                privateKey = fixed.privateKey,
-                peerPublicKey = fixed.peerPublicKey,
-                preSharedKey = fixed.preSharedKey,
-                reserved = fixed.reserved,
-                peers = fixed.peers
-            )
-
-            "ssh" -> Outbound(
-                type = fixed.type,
-                tag = fixed.tag,
-                server = fixed.server,
-                serverPort = fixed.serverPort,
-                user = fixed.user,
-                password = fixed.password,
-                privateKeyPath = fixed.privateKeyPath,
-                privateKeyPassphrase = fixed.privateKeyPassphrase,
-                hostKey = fixed.hostKey,
-                hostKeyAlgorithms = fixed.hostKeyAlgorithms,
-                clientVersion = fixed.clientVersion
-            )
-
-            "shadowtls" -> Outbound(
-                type = fixed.type,
-                tag = fixed.tag,
-                version = fixed.version,
-                password = fixed.password,
-                detour = fixed.detour
-            )
-
-            else -> fixed
-        }
-    }
+    private fun buildOutboundForRuntime(outbound: Outbound): Outbound = OutboundFixer.buildForRuntime(outbound)
 
     /**
      * 构建自定义规则集配置
@@ -3003,10 +2258,6 @@ class ConfigRepository(private val context: Context) {
                     val tag = "P:$profileName"
                     if (outbounds.any { it.tag == tag }) tag else defaultProxyTag
                 }
-                RuleSetOutboundMode.GROUP -> {
-                    if (value.isNullOrBlank()) return defaultProxyTag
-                    if (outbounds.any { it.tag == value }) value else defaultProxyTag
-                }
             }
         }
 
@@ -3073,12 +2324,11 @@ class ConfigRepository(private val context: Context) {
                 { ruleSet ->
                     when (ruleSet.outboundMode) {
                         RuleSetOutboundMode.NODE -> 0
-                        RuleSetOutboundMode.GROUP -> 1
-                        RuleSetOutboundMode.PROXY -> 2
-                        RuleSetOutboundMode.DIRECT -> 3
-                        RuleSetOutboundMode.BLOCK -> 4
-                        RuleSetOutboundMode.PROFILE -> 2
-                        null -> 5
+                        RuleSetOutboundMode.PROXY -> 1
+                        RuleSetOutboundMode.DIRECT -> 2
+                        RuleSetOutboundMode.BLOCK -> 3
+                        RuleSetOutboundMode.PROFILE -> 1
+                        null -> 4
                     }
                 }
             )
@@ -3109,14 +2359,6 @@ class ConfigRepository(private val context: Context) {
                      } else {
                          defaultProxyTag
                      }
-                }
-                RuleSetOutboundMode.GROUP -> {
-                    val groupName = ruleSet.outboundValue
-                    if (!groupName.isNullOrEmpty() && outbounds.any { it.tag == groupName }) {
-                         groupName
-                    } else {
-                         defaultProxyTag
-                    }
                 }
             }
 
@@ -3180,13 +2422,9 @@ class ConfigRepository(private val context: Context) {
                     val tag = "P:$profileName"
                     if (outbounds.any { it.tag == tag }) tag else defaultProxyTag
                 }
-                RuleSetOutboundMode.GROUP -> {
-                    if (value.isNullOrBlank()) return defaultProxyTag
-                    if (outbounds.any { it.tag == value }) value else defaultProxyTag
-                }
             }
         }
-        
+
         // 1. 处理应用规则（单个应用）
         settings.appRules.filter { it.enabled }.forEach { rule ->
             val outboundTag = resolveOutboundTag(rule.outboundMode, rule.outboundValue)
@@ -3240,77 +2478,6 @@ class ConfigRepository(private val context: Context) {
         return rules
     }
 
-    /**
-     * 合并自定义 Outbounds JSON
-     */
-    private fun mergeCustomOutbounds(outbounds: List<Outbound>, customJson: String): List<Outbound> {
-        if (customJson.isBlank()) return outbounds
-        return try {
-            val customOutbounds = gson.fromJson<List<Outbound>>(
-                customJson,
-                object : com.google.gson.reflect.TypeToken<List<Outbound>>() {}.type
-            ) ?: emptyList()
-            if (customOutbounds.isEmpty()) {
-                outbounds
-            } else {
-                // 自定义 outbounds 添加到列表末尾，但在 direct/block/dns-out 之前
-                val systemTags = setOf("direct", "block", "dns-out")
-                val userOutbounds = outbounds.filter { it.tag !in systemTags }
-                val systemOutbounds = outbounds.filter { it.tag in systemTags }
-                userOutbounds + customOutbounds + systemOutbounds
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to parse custom outbounds JSON: ${e.message}")
-            outbounds
-        }
-    }
-
-    /**
-     * 合并自定义路由规则 JSON
-     */
-    private fun mergeCustomRouteRules(route: RouteConfig, customJson: String): RouteConfig {
-        if (customJson.isBlank()) return route
-        return try {
-            val customRules = gson.fromJson<List<RouteRule>>(
-                customJson,
-                object : com.google.gson.reflect.TypeToken<List<RouteRule>>() {}.type
-            ) ?: emptyList()
-            if (customRules.isEmpty()) {
-                route
-            } else {
-                // 自定义规则添加到规则列表开头（优先级最高）
-                val existingRules = route.rules ?: emptyList()
-                route.copy(rules = customRules + existingRules)
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to parse custom route rules JSON: ${e.message}")
-            route
-        }
-    }
-
-    /**
-     * 合并自定义 DNS 规则 JSON
-     */
-    private fun mergeCustomDnsRules(dns: DnsConfig, customJson: String): DnsConfig {
-        if (customJson.isBlank()) return dns
-        return try {
-            val customRules = gson.fromJson<List<DnsRule>>(
-                customJson,
-                object : com.google.gson.reflect.TypeToken<List<DnsRule>>() {}.type
-            ) ?: emptyList()
-            if (customRules.isEmpty()) {
-                dns
-            } else {
-                // 自定义规则添加到规则列表开头（优先级最高）
-                val existingRules = dns.rules ?: emptyList()
-                dns.copy(rules = customRules + existingRules)
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to parse custom DNS rules JSON: ${e.message}")
-            dns
-        }
-    }
-
     private fun buildRunLogConfig(): LogConfig {
         return LogConfig(
             level = "warn",
@@ -3341,61 +2508,9 @@ class ConfigRepository(private val context: Context) {
         )
     }
 
-    private fun buildRunInbounds(settings: AppSettings): List<Inbound> {
-        // 添加入站配置
-        val inbounds = mutableListOf<Inbound>()
 
-        // 1. 添加混合入站 (Mixed Port)
-        if (settings.proxyPort > 0) {
-            inbounds.add(
-                Inbound(
-                    type = "mixed",
-                    tag = "mixed-in",
-                    listen = if (settings.allowLan) "0.0.0.0" else "127.0.0.1",
-                    listenPort = settings.proxyPort,
-                    sniff = true,
-                    sniffOverrideDestination = true,
-                    sniffTimeout = "300ms"
-                )
-            )
-        }
-
-        if (settings.tunEnabled) {
-            inbounds.add(
-                Inbound(
-                    type = "tun",
-                    tag = "tun-in",
-                    interfaceName = settings.tunInterfaceName,
-                    inet4AddressRaw = listOf("172.19.0.1/30"),
-                    mtu = settings.tunMtu,
-                    autoRoute = false, // Handled by Android VpnService
-                    strictRoute = false, // Can cause issues on some Android versions
-                    // 智能降级逻辑：如果设备不支持 system/mixed 模式（缺少 CAP_NET_RAW 权限），
-                    // 自动降级到 gvisor 模式。UI 仍显示用户选择的模式。
-                    stack = getEffectiveTunStack(settings.tunStack).name.lowercase(),
-                    endpointIndependentNat = settings.endpointIndependentNat,
-                    sniff = true,
-                    sniffOverrideDestination = true,
-                    sniffTimeout = "300ms"
-                )
-            )
-        } else if (settings.proxyPort <= 0) {
-            // 如果禁用 TUN 且未设置自定义端口，则添加默认混合入站（HTTP+SOCKS），方便本地代理使用
-            inbounds.add(
-                Inbound(
-                    type = "mixed",
-                    tag = "mixed-in",
-                    listen = "127.0.0.1",
-                    listenPort = 2080,
-                    sniff = true,
-                    sniffOverrideDestination = true,
-                    sniffTimeout = "300ms"
-                )
-            )
-        }
-
-        return inbounds
-    }
+    private fun buildRunInbounds(settings: AppSettings): List<Inbound> =
+        InboundBuilder.build(settings, getEffectiveTunStack(settings.tunStack))
 
     private fun buildRunDns(settings: AppSettings, validRuleSets: List<RuleSetConfig>): DnsConfig {
         // 添加 DNS 配置
@@ -3644,7 +2759,6 @@ class ConfigRepository(private val context: Context) {
         // --- 处理跨配置节点引用 ---
         val activeProfileId = _activeProfileId.value
         val requiredNodeIds = mutableSetOf<String>()
-        val requiredGroupNames = mutableSetOf<String>()
         val requiredProfileIds = mutableSetOf<String>()
 
         fun resolveNodeRefToId(value: String?): String? {
@@ -3665,11 +2779,10 @@ class ConfigRepository(private val context: Context) {
             return node?.id
         }
 
-        // 收集所有规则中引用的节点 ID、组名称和配置 ID
+        // 收集所有规则中引用的节点 ID 和配置 ID
         settings.appRules.filter { it.enabled }.forEach { rule ->
             when (rule.outboundMode) {
                 RuleSetOutboundMode.NODE -> resolveNodeRefToId(rule.outboundValue)?.let { requiredNodeIds.add(it) }
-                RuleSetOutboundMode.GROUP -> rule.outboundValue?.let { requiredGroupNames.add(it) }
                 RuleSetOutboundMode.PROFILE -> rule.outboundValue?.let { requiredProfileIds.add(it) }
                 else -> {}
             }
@@ -3677,7 +2790,6 @@ class ConfigRepository(private val context: Context) {
         settings.appGroups.filter { it.enabled }.forEach { group ->
             when (group.outboundMode) {
                 RuleSetOutboundMode.NODE -> resolveNodeRefToId(group.outboundValue)?.let { requiredNodeIds.add(it) }
-                RuleSetOutboundMode.GROUP -> group.outboundValue?.let { requiredGroupNames.add(it) }
                 RuleSetOutboundMode.PROFILE -> group.outboundValue?.let { requiredProfileIds.add(it) }
                 else -> {}
             }
@@ -3685,7 +2797,6 @@ class ConfigRepository(private val context: Context) {
         settings.ruleSets.filter { it.enabled }.forEach { ruleSet ->
             when (ruleSet.outboundMode) {
                 RuleSetOutboundMode.NODE -> resolveNodeRefToId(ruleSet.outboundValue)?.let { requiredNodeIds.add(it) }
-                RuleSetOutboundMode.GROUP -> ruleSet.outboundValue?.let { requiredGroupNames.add(it) }
                 RuleSetOutboundMode.PROFILE -> ruleSet.outboundValue?.let { requiredProfileIds.add(it) }
                 else -> {}
             }
@@ -3694,12 +2805,7 @@ class ConfigRepository(private val context: Context) {
         // 确保当前选中的节点始终可用
         activeNode?.let { requiredNodeIds.add(it.id) }
 
-        // 将所需组和配置中的所有节点 ID 也加入到 requiredNodeIds
-        requiredGroupNames.forEach { groupName ->
-            allNodes.filter { it.group == groupName }.forEach { node ->
-                requiredNodeIds.add(node.id)
-            }
-        }
+        // 将所需配置中的所有节点 ID 也加入到 requiredNodeIds
         requiredProfileIds.forEach { profileId ->
             allNodes.filter { it.sourceProfileId == profileId }.forEach { node ->
                 requiredNodeIds.add(node.id)
@@ -3761,10 +2867,10 @@ class ConfigRepository(private val context: Context) {
             // 尝试多种方式匹配 outbound
             val sourceOutbound = sourceConfig.outbounds?.find { it.tag == node.name }
                 ?: sourceConfig.outbounds?.find { it.tag.equals(node.name, ignoreCase = true) }
-                ?: sourceConfig.outbounds?.find { 
+                ?: sourceConfig.outbounds?.find {
                     // 尝试模糊匹配：去除空格和特殊字符后比较
-                    it.tag.replace(Regex("[\\s\\-_]"), "").equals(
-                        node.name.replace(Regex("[\\s\\-_]"), ""), 
+                    it.tag.replace(REGEX_WHITESPACE_DASH, "").equals(
+                        node.name.replace(REGEX_WHITESPACE_DASH, ""),
                         ignoreCase = true
                     )
                 }
@@ -3797,41 +2903,7 @@ class ConfigRepository(private val context: Context) {
 
         }
 
-        // 3. 处理需要的节点组 (Merge/Create selectors)
-        requiredGroupNames.forEach { groupName ->
-            val nodesInGroup = allNodes.filter { it.group == groupName }
-            val nodeTags = nodesInGroup.mapNotNull { nodeTagMap[it.id] }
-
-            if (nodeTags.isNotEmpty()) {
-                val existingIndex = fixedOutbounds.indexOfFirst { it.tag == groupName }
-                if (existingIndex >= 0) {
-                    val existing = fixedOutbounds[existingIndex]
-                    if (existing.type == "selector" || existing.type == "urltest") {
-                        // Merge tags: existing + new (deduplicated)
-                        val combinedTags = ((existing.outbounds ?: emptyList()) + nodeTags).distinct()
-                        // 确保列表不为空
-                        val safeTags = if (combinedTags.isEmpty()) listOf("direct") else combinedTags
-                        val safeDefault = existing.default?.takeIf { it in safeTags } ?: safeTags.firstOrNull()
-                        fixedOutbounds[existingIndex] = existing.copy(outbounds = safeTags, default = safeDefault)
-                    } else {
-                        Log.w(TAG, "Tag collision: '$groupName' is needed as group but exists as ${existing.type}")
-                    }
-                } else {
-                    // Create new selector
-                    val newSelector = Outbound(
-                        type = "selector",
-                        tag = groupName,
-                        outbounds = nodeTags.distinct(),
-                        default = nodeTags.firstOrNull(),
-                        interruptExistConnections = false
-                    )
-                    // Insert at beginning to ensure visibility/precedence
-                    fixedOutbounds.add(0, newSelector)
-                }
-            }
-        }
-
-        // 4. 处理需要的配置 (Create Profile selectors)
+        // 3. 处理需要的配置 (Create Profile selectors)
         requiredProfileIds.forEach { profileId ->
             val profileNodes = allNodes.filter { it.sourceProfileId == profileId }
             val nodeTags = profileNodes.mapNotNull { nodeTagMap[it.id] }
@@ -4097,22 +3169,51 @@ class ConfigRepository(private val context: Context) {
      */
     /**
      * 手动创建节点（从空白 Outbound 创建）
-     * 复用 addSingleNode 的逻辑，但直接接收 Outbound 对象
+     * @param outbound 要创建的节点
+     * @param targetProfileId 目标配置ID（如指定则添加到该配置）
+     * @param newProfileName 新配置名称（如指定则创建新配置并添加）
      */
-    fun createNode(outbound: Outbound) {
+    fun createNode(
+        outbound: Outbound,
+        targetProfileId: String? = null,
+        newProfileName: String? = null
+    ) {
         try {
-            // 1. 查找或创建"手动添加"配置
-            val manualProfileName = "Manual"
-            var manualProfile = _profiles.value.find { it.name == manualProfileName && it.type == ProfileType.Imported }
             val profileId: String
             val existingConfig: SingBoxConfig?
+            var targetProfile: ProfileUi? = null
+            val finalProfileName: String
 
-            if (manualProfile != null) {
-                profileId = manualProfile.id
-                existingConfig = loadConfig(profileId)
-            } else {
-                profileId = UUID.randomUUID().toString()
-                existingConfig = null
+            when {
+                targetProfileId != null -> {
+                    targetProfile = _profiles.value.find { it.id == targetProfileId }
+                    if (targetProfile != null) {
+                        profileId = targetProfileId
+                        existingConfig = loadConfig(profileId)
+                        finalProfileName = targetProfile.name
+                    } else {
+                        profileId = UUID.randomUUID().toString()
+                        existingConfig = null
+                        finalProfileName = "Manual"
+                    }
+                }
+                newProfileName != null -> {
+                    profileId = UUID.randomUUID().toString()
+                    existingConfig = null
+                    finalProfileName = newProfileName
+                }
+                else -> {
+                    val manualProfileName = "Manual"
+                    targetProfile = _profiles.value.find { it.name == manualProfileName && it.type == ProfileType.Imported }
+                    if (targetProfile != null) {
+                        profileId = targetProfile.id
+                        existingConfig = loadConfig(profileId)
+                    } else {
+                        profileId = UUID.randomUUID().toString()
+                        existingConfig = null
+                    }
+                    finalProfileName = manualProfileName
+                }
             }
 
             // 2. 合并或创建 outbounds
@@ -4144,47 +3245,51 @@ class ConfigRepository(private val context: Context) {
 
             val newConfig = deduplicateTags(SingBoxConfig(outbounds = newOutbounds))
 
-            // 3. 保存配置文件
             val configFile = File(configDir, "$profileId.json")
             configFile.writeText(gson.toJson(newConfig))
 
-            // 4. 更新内存状态
             cacheConfig(profileId, newConfig)
-            val nodes = extractNodesFromConfig(newConfig, profileId)
-            profileNodes[profileId] = nodes
 
-            // 5. 如果是新配置，添加到 profiles 列表
-            if (manualProfile == null) {
-                manualProfile = ProfileUi(
+            if (targetProfile == null) {
+                targetProfile = ProfileUi(
                     id = profileId,
-                    name = manualProfileName,
+                    name = finalProfileName,
                     type = ProfileType.Imported,
                     url = null,
                     lastUpdated = System.currentTimeMillis(),
                     enabled = true,
                     updateStatus = UpdateStatus.Idle
                 )
-                _profiles.update { it + manualProfile }
+                _profiles.update { it + targetProfile }
             } else {
                 _profiles.update { list ->
                     list.map { if (it.id == profileId) it.copy(lastUpdated = System.currentTimeMillis()) else it }
                 }
             }
 
-            // 6. 更新全局节点状态
-            updateAllNodesAndGroups()
-
-            // 7. 激活配置并选中新节点
             setActiveProfile(profileId)
-            val addedNode = nodes.find { it.name == finalTag }
-            if (addedNode != null) {
-                _activeNodeId.value = addedNode.id
+
+            // 优化: 使用协程提取节点，避免 runBlocking 阻塞
+            // 将节点提取和后续处理放在协程中异步执行
+            scope.launch {
+                val nodes = extractNodesFromConfig(newConfig, profileId)
+                profileNodes[profileId] = nodes
+
+                // 更新 UI 状态
+                if (_activeProfileId.value == profileId) {
+                    _nodes.value = nodes
+                }
+                updateAllNodesAndGroups()
+
+                // 选中新节点
+                val addedNode = nodes.find { it.name == finalTag }
+                if (addedNode != null) {
+                    _activeNodeId.value = addedNode.id
+                }
+
+                saveProfiles()
+                Log.i(TAG, "Created node: $finalTag in profile $profileId")
             }
-
-            // 8. 保存配置
-            saveProfiles()
-
-            Log.i(TAG, "Created node: $finalTag in profile $profileId")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to create node", e)
         }
@@ -4201,11 +3306,6 @@ class ConfigRepository(private val context: Context) {
 
         // 更新内存中的配置
         cacheConfig(profileId, newConfig)
-        
-        // 重新提取节点列表
-        val newNodes = extractNodesFromConfig(newConfig, profileId)
-        profileNodes[profileId] = newNodes
-        updateAllNodesAndGroups()
 
         // 保存文件
         try {
@@ -4215,58 +3315,80 @@ class ConfigRepository(private val context: Context) {
             e.printStackTrace()
         }
 
-        // 如果是当前活跃配置，更新UI状态
-        if (_activeProfileId.value == profileId) {
-            _nodes.value = newNodes
-            updateNodeGroups(newNodes)
-            
-            // 如果删除的是当前选中节点，重置选中
-            if (_activeNodeId.value == nodeId) {
-                _activeNodeId.value = newNodes.firstOrNull()?.id
+        // 优化: 使用协程提取节点，避免 runBlocking 阻塞
+        scope.launch {
+            val newNodes = extractNodesFromConfig(newConfig, profileId)
+            profileNodes[profileId] = newNodes
+            updateAllNodesAndGroups()
+
+            // 如果是当前活跃配置，更新UI状态
+            if (_activeProfileId.value == profileId) {
+                _nodes.value = newNodes
+
+                // 如果删除的是当前选中节点，重置选中
+                if (_activeNodeId.value == nodeId) {
+                    _activeNodeId.value = newNodes.firstOrNull()?.id
+                }
             }
+
+            saveProfiles()
         }
-        
-        saveProfiles()
     }
 
     /**
-     * 添加单个节点
-     * 如果存在"手动添加"配置，则将节点添加到该配置中
-     * 如果不存在，则创建新的"手动添加"配置
+     * 添加单个节点到指定配置
      *
      * @param link 节点链接（vmess://, vless://, ss://, etc）
+     * @param targetProfileId 目标配置ID，null则创建新配置或使用默认配置
+     * @param newProfileName 新配置名称，当targetProfileId为null时使用
      * @return 成功返回添加的节点，失败返回错误信息
      */
-    suspend fun addSingleNode(link: String): Result<NodeUi> = withContext(Dispatchers.IO) {
+    suspend fun addSingleNode(
+        link: String,
+        targetProfileId: String? = null,
+        newProfileName: String? = null
+    ): Result<NodeUi> = withContext(Dispatchers.IO) {
         try {
-            // 1. 使用 ConfigRepository 统一的 parseNodeLink 解析链接，确保解析逻辑一致
             val outbound = parseNodeLink(link.trim())
                 ?: return@withContext Result.failure(Exception("Failed to parse node link"))
             
-            // 2. 查找或创建"手动添加"配置
-            val manualProfileName = "Manual"
-            var manualProfile = _profiles.value.find { it.name == manualProfileName && it.type == ProfileType.Imported }
             val profileId: String
             val existingConfig: SingBoxConfig?
+            var isNewProfile = false
             
-            if (manualProfile != null) {
-                // 使用已有的"手动添加"配置
-                profileId = manualProfile.id
-                existingConfig = loadConfig(profileId)
-            } else {
-                // 创建新的"手动添加"配置
-                profileId = UUID.randomUUID().toString()
-                existingConfig = null
+            when {
+                targetProfileId != null -> {
+                    val profile = _profiles.value.find { it.id == targetProfileId }
+                    if (profile == null) {
+                        return@withContext Result.failure(Exception("Profile not found"))
+                    }
+                    profileId = targetProfileId
+                    existingConfig = loadConfig(profileId)
+                }
+                newProfileName != null -> {
+                    profileId = UUID.randomUUID().toString()
+                    existingConfig = null
+                    isNewProfile = true
+                }
+                else -> {
+                    val manualProfileName = "Manual"
+                    val manualProfile = _profiles.value.find { it.name == manualProfileName && it.type == ProfileType.Imported }
+                    if (manualProfile != null) {
+                        profileId = manualProfile.id
+                        existingConfig = loadConfig(profileId)
+                    } else {
+                        profileId = UUID.randomUUID().toString()
+                        existingConfig = null
+                        isNewProfile = true
+                    }
+                }
             }
             
-            // 3. 合并或创建 outbounds
             val newOutbounds = mutableListOf<Outbound>()
             existingConfig?.outbounds?.let { existing ->
-                // 添加现有的非系统 outbounds
                 newOutbounds.addAll(existing.filter { it.type !in listOf("direct", "block", "dns") })
             }
             
-            // 检查是否有同名节点，如有则添加后缀
             var finalTag = outbound.tag
             var counter = 1
             while (newOutbounds.any { it.tag == finalTag }) {
@@ -4276,7 +3398,6 @@ class ConfigRepository(private val context: Context) {
             val finalOutbound = if (finalTag != outbound.tag) outbound.copy(tag = finalTag) else outbound
             newOutbounds.add(finalOutbound)
             
-            // 添加系统 outbounds
             if (newOutbounds.none { it.tag == "direct" }) {
                 newOutbounds.add(Outbound(type = "direct", tag = "direct"))
             }
@@ -4287,48 +3408,41 @@ class ConfigRepository(private val context: Context) {
                 newOutbounds.add(Outbound(type = "dns", tag = "dns-out"))
             }
             
-            // 确保没有其他重复
             val newConfig = deduplicateTags(SingBoxConfig(outbounds = newOutbounds))
             
-            // 4. 保存配置文件
             val configFile = File(configDir, "$profileId.json")
             configFile.writeText(gson.toJson(newConfig))
             
-            // 5. 更新内存状态
             cacheConfig(profileId, newConfig)
             val nodes = extractNodesFromConfig(newConfig, profileId)
             profileNodes[profileId] = nodes
             
-            // 6. 如果是新配置，添加到 profiles 列表
-            if (manualProfile == null) {
-                manualProfile = ProfileUi(
+            if (isNewProfile || existingConfig == null) {
+                val profileName = newProfileName ?: "Manual"
+                val newProfile = ProfileUi(
                     id = profileId,
-                    name = manualProfileName,
+                    name = profileName,
                     type = ProfileType.Imported,
                     url = null,
                     lastUpdated = System.currentTimeMillis(),
                     enabled = true,
                     updateStatus = UpdateStatus.Idle
                 )
-                _profiles.update { it + manualProfile }
+                _profiles.update { it + newProfile }
             } else {
-                // 更新 lastUpdated
                 _profiles.update { list ->
                     list.map { if (it.id == profileId) it.copy(lastUpdated = System.currentTimeMillis()) else it }
                 }
             }
             
-            // 7. 更新全局节点状态
             updateAllNodesAndGroups()
             
-            // 8. 激活配置并选中新节点
             setActiveProfile(profileId)
             val addedNode = nodes.find { it.name == finalTag }
             if (addedNode != null) {
                 _activeNodeId.value = addedNode.id
             }
             
-            // 9. 保存配置
             saveProfiles()
             
             Log.i(TAG, "Added single node: $finalTag to profile $profileId")
@@ -4357,21 +3471,6 @@ class ConfigRepository(private val context: Context) {
 
         // 更新内存中的配置
         cacheConfig(profileId, newConfig)
-        
-        val oldNodes = profileNodes[profileId] ?: _nodes.value
-        val latencyById = oldNodes.associate { it.id to it.latencyMs }
-        val updatedNodeId = stableNodeId(profileId, newName)
-        val originalLatency = oldNodes.find { it.id == nodeId }?.latencyMs
-
-        // 重新提取节点列表
-        val newNodes = extractNodesFromConfig(newConfig, profileId)
-        val mergedNodes = newNodes.map { nodeItem ->
-            val storedLatency = latencyById[nodeItem.id]
-                ?: if (nodeItem.id == updatedNodeId) originalLatency else null
-            if (storedLatency != null) nodeItem.copy(latencyMs = storedLatency) else nodeItem
-        }
-        profileNodes[profileId] = mergedNodes
-        updateAllNodesAndGroups()
 
         // 保存文件
         try {
@@ -4381,21 +3480,37 @@ class ConfigRepository(private val context: Context) {
             e.printStackTrace()
         }
 
-        // 如果是当前活跃配置，更新UI状态
-        if (_activeProfileId.value == profileId) {
-            _nodes.value = mergedNodes
-            updateNodeGroups(mergedNodes)
-            
-            // 如果重命名的是当前选中节点，更新 activeNodeId
-            if (_activeNodeId.value == nodeId) {
-                val newNode = mergedNodes.find { it.name == newName }
-                if (newNode != null) {
-                    _activeNodeId.value = newNode.id
+        val oldNodes = profileNodes[profileId] ?: _nodes.value
+        val latencyById = oldNodes.associate { it.id to it.latencyMs }
+        val updatedNodeId = stableNodeId(profileId, newName)
+        val originalLatency = oldNodes.find { it.id == nodeId }?.latencyMs
+
+        // 优化: 使用协程提取节点，避免 runBlocking 阻塞
+        scope.launch {
+            val newNodes = extractNodesFromConfig(newConfig, profileId)
+            val mergedNodes = newNodes.map { nodeItem ->
+                val storedLatency = latencyById[nodeItem.id]
+                    ?: if (nodeItem.id == updatedNodeId) originalLatency else null
+                if (storedLatency != null) nodeItem.copy(latencyMs = storedLatency) else nodeItem
+            }
+            profileNodes[profileId] = mergedNodes
+            updateAllNodesAndGroups()
+
+            // 如果是当前活跃配置，更新UI状态
+            if (_activeProfileId.value == profileId) {
+                _nodes.value = mergedNodes
+
+                // 如果重命名的是当前选中节点，更新 activeNodeId
+                if (_activeNodeId.value == nodeId) {
+                    val newNode = mergedNodes.find { it.name == newName }
+                    if (newNode != null) {
+                        _activeNodeId.value = newNode.id
+                    }
                 }
             }
+
+            saveProfiles()
         }
-        
-        saveProfiles()
     }
 
     /**
@@ -4416,23 +3531,8 @@ class ConfigRepository(private val context: Context) {
 
         // 更新内存中的配置
         cacheConfig(profileId, newConfig)
-        
-        val oldNodes = profileNodes[profileId] ?: _nodes.value
-        val latencyById = oldNodes.associate { it.id to it.latencyMs }
-        val updatedNodeId = stableNodeId(profileId, newOutbound.tag)
-        val originalLatency = oldNodes.find { it.id == nodeId }?.latencyMs
 
-        // 重新提取节点列表
-        val newNodes = extractNodesFromConfig(newConfig, profileId)
-        val mergedNodes = newNodes.map { nodeItem ->
-            val storedLatency = latencyById[nodeItem.id]
-                ?: if (nodeItem.id == updatedNodeId) originalLatency else null
-            if (storedLatency != null) nodeItem.copy(latencyMs = storedLatency) else nodeItem
-        }
-        profileNodes[profileId] = mergedNodes
-        updateAllNodesAndGroups()
-
-        // 保存文件
+        // 先保存文件（同步操作，确保数据持久化）
         try {
             val configFile = File(configDir, "$profileId.json")
             configFile.writeText(gson.toJson(newConfig))
@@ -4440,21 +3540,41 @@ class ConfigRepository(private val context: Context) {
             e.printStackTrace()
         }
 
-        // 如果是当前活跃配置，更新UI状态
-        if (_activeProfileId.value == profileId) {
-            _nodes.value = mergedNodes
-            updateNodeGroups(mergedNodes)
-            
-            // 如果更新的是当前选中节点，尝试恢复选中状态
-            if (_activeNodeId.value == nodeId) {
-                val newNode = mergedNodes.find { it.name == newOutbound.tag }
-                if (newNode != null) {
-                    _activeNodeId.value = newNode.id
+        // 保存延迟数据供协程使用
+        val oldNodes = profileNodes[profileId] ?: _nodes.value
+        val latencyById = oldNodes.associate { it.id to it.latencyMs }
+        val updatedNodeId = stableNodeId(profileId, newOutbound.tag)
+        val originalLatency = oldNodes.find { it.id == nodeId }?.latencyMs
+        val isActiveProfile = _activeProfileId.value == profileId
+        val isActiveNode = _activeNodeId.value == nodeId
+        val newTag = newOutbound.tag
+
+        // 异步提取节点列表和更新 UI
+        scope.launch {
+            val newNodes = extractNodesFromConfig(newConfig, profileId)
+            val mergedNodes = newNodes.map { nodeItem ->
+                val storedLatency = latencyById[nodeItem.id]
+                    ?: if (nodeItem.id == updatedNodeId) originalLatency else null
+                if (storedLatency != null) nodeItem.copy(latencyMs = storedLatency) else nodeItem
+            }
+            profileNodes[profileId] = mergedNodes
+            updateAllNodesAndGroups()
+
+            // 如果是当前活跃配置，更新UI状态
+            if (isActiveProfile) {
+                _nodes.value = mergedNodes
+
+                // 如果更新的是当前选中节点，尝试恢复选中状态
+                if (isActiveNode) {
+                    val newNode = mergedNodes.find { it.name == newTag }
+                    if (newNode != null) {
+                        _activeNodeId.value = newNode.id
+                    }
                 }
             }
+
+            saveProfiles()
         }
-        
-        saveProfiles()
     }
 
     /**

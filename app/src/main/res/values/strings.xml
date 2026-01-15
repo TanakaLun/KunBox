@@ -12,6 +12,12 @@
     <string name="shortcut_scan">扫描二维码</string>
     <string name="shortcut_scan_short">扫描</string>
 
+    <!-- Update Notification -->
+    <string name="update_channel_name">版本更新</string>
+    <string name="update_channel_description">新版本发布通知</string>
+    <string name="update_notification_title">发现新版本</string>
+    <string name="update_notification_content">KunBox %s 已发布，点击查看详情</string>
+
     <!-- Common -->
     <string name="common_confirm">确认</string>
     <string name="common_cancel">取消</string>
@@ -235,10 +241,14 @@
 
     <!-- Nodes -->
     <string name="nodes_title">节点列表</string>
+    <string name="nodes_count_suffix">个节点</string>
     <string name="nodes_sort">排序</string>
     <string name="nodes_filter">筛选</string>
     <string name="nodes_add">添加节点</string>
     <string name="nodes_add_hint">输入节点链接 (vmess://, vless://, ss://, etc)...</string>
+    <string name="nodes_add_to_profile">添加到配置</string>
+    <string name="nodes_add_create_new_profile">创建新配置</string>
+    <string name="nodes_add_new_profile_name_hint">输入新配置名称...</string>
     <string name="nodes_export_link">导出链接</string>
     <string name="nodes_copied_to_clipboard">已复制到剪贴板</string>
     <string name="nodes_clear_latency">清空延迟</string>
@@ -270,6 +280,11 @@
     <string name="node_filter_keywords">关键字</string>
     <string name="node_filter_keywords_hint">多个关键字用逗号分隔，如：香港, HK, 港</string>
     <string name="node_filter_keywords_tip">提示：关键字匹配节点名称，不区分大小写</string>
+
+    <!-- Node Stats -->
+    <string name="nodes_stat_total">%d 节点</string>
+    <string name="nodes_stat_available">%d 可用</string>
+    <string name="nodes_stat_avg_latency">%dms</string>
 
     <!-- Node Detail -->
     <string name="node_detail_title">服务器配置</string>
@@ -317,7 +332,6 @@
     <string name="rulesets_select_outbound">选择出站模式</string>
     <string name="rulesets_select_profile">选择配置</string>
     <string name="rulesets_select_node">选择节点</string>
-    <string name="rulesets_select_group">选择节点组</string>
     <string name="rulesets_select_inbound">选择入站</string>
     <string name="rulesets_type">类型</string>
     <string name="rulesets_format">格式</string>
@@ -352,7 +366,6 @@
     <string name="app_rules_delete_confirm">确定要删除 \"%s\" 的分流规则吗？</string>
     <string name="app_rules_not_selected">未选择</string>
     <string name="app_rules_unknown_profile">未知配置</string>
-    <string name="app_rules_unknown_group">未知组</string>
     <string name="app_rules_tabs_groups">应用分组</string>
     <string name="app_rules_tabs_individual">独立规则</string>
     <string name="app_rules_empty_groups">暂无应用分组</string>
@@ -581,7 +594,6 @@
     <string name="ruleset_outbound_proxy">代理</string>
     <string name="ruleset_outbound_node">单节点</string>
     <string name="ruleset_outbound_profile">配置</string>
-    <string name="ruleset_outbound_group">节点组</string>
 
     <!-- Update Status Messages -->
     <string name="update_status_no_subscription">没有可更新的订阅</string>
@@ -590,20 +602,6 @@
     <string name="update_status_success_no_changes">更新完成，无变化</string>
     <string name="update_status_partial">更新完成，%1$d个成功，%2$d个失败</string>
     <string name="update_status_complete">更新完成</string>
-
-    <!-- Custom Config -->
-    <string name="custom_config_title">自定义配置</string>
-    <string name="custom_config_subtitle">编辑自定义 JSON 配置</string>
-    <string name="custom_config_view">查看</string>
-    <string name="custom_config_outbounds">Outbounds</string>
-    <string name="custom_config_route_rules">路由规则</string>
-    <string name="custom_config_dns_rules">DNS规则</string>
-    <string name="custom_config_saved">配置已保存</string>
-    <string name="custom_config_invalid_json">JSON 格式无效</string>
-    <string name="custom_config_no_running_config">暂无运行配置，请先启动 VPN</string>
-    <string name="custom_config_outbounds_hint">输入自定义 Outbounds JSON 数组，将合并到生成的配置中</string>
-    <string name="custom_config_route_rules_hint">输入自定义路由规则 JSON 数组，将合并到生成的配置中</string>
-    <string name="custom_config_dns_rules_hint">输入自定义 DNS 规则 JSON 数组，将合并到生成的配置中</string>
 
     <!-- Infinite Date -->
     <string name="date_infinite">无限期</string>

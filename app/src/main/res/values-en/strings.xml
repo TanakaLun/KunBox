@@ -12,6 +12,12 @@
     <string name="shortcut_scan">Scan QR Code</string>
     <string name="shortcut_scan_short">Scan</string>
 
+    <!-- Update Notification -->
+    <string name="update_channel_name">App Updates</string>
+    <string name="update_channel_description">New version release notifications</string>
+    <string name="update_notification_title">New Version Available</string>
+    <string name="update_notification_content">KunBox %s is now available, tap to view details</string>
+
     <!-- Common -->
     <string name="common_confirm">Confirm</string>
     <string name="common_cancel">Cancel</string>
@@ -235,10 +241,14 @@
 
     <!-- Nodes -->
     <string name="nodes_title">Node List</string>
+    <string name="nodes_count_suffix">nodes</string>
     <string name="nodes_sort">Sort</string>
     <string name="nodes_filter">Filter</string>
     <string name="nodes_add">Add Node</string>
     <string name="nodes_add_hint">Enter node link (vmess://, vless://, ss://, etc)...</string>
+    <string name="nodes_add_to_profile">Add to Profile</string>
+    <string name="nodes_add_create_new_profile">Create New Profile</string>
+    <string name="nodes_add_new_profile_name_hint">Enter new profile name...</string>
     <string name="nodes_export_link">Export Link</string>
     <string name="nodes_copied_to_clipboard">Copied to clipboard</string>
     <string name="nodes_clear_latency">Clear Latency</string>
@@ -313,7 +323,6 @@
     <string name="rulesets_select_outbound">Select Outbound Mode</string>
     <string name="rulesets_select_profile">Select Profile</string>
     <string name="rulesets_select_node">Select Node</string>
-    <string name="rulesets_select_group">Select Node Group</string>
     <string name="rulesets_select_inbound">Select Inbound</string>
     <string name="rulesets_type">Type</string>
     <string name="rulesets_format">Format</string>
@@ -349,7 +358,6 @@
     <string name="app_rules_delete_confirm">Are you sure you want to delete the routing rule for \"%s\"?</string>
     <string name="app_rules_not_selected">Not Selected</string>
     <string name="app_rules_unknown_profile">Unknown Profile</string>
-    <string name="app_rules_unknown_group">Unknown Group</string>
     <string name="app_rules_tabs_groups">App Groups</string>
     <string name="app_rules_tabs_individual">Individual Rules</string>
     <string name="app_rules_empty_groups">No app groups</string>
@@ -575,7 +583,6 @@
     <string name="ruleset_outbound_proxy">Proxy</string>
     <string name="ruleset_outbound_node">Single Node</string>
     <string name="ruleset_outbound_profile">Profile</string>
-    <string name="ruleset_outbound_group">Node Group</string>
 
     <!-- Update Status Messages -->
     <string name="update_status_no_subscription">No subscription to update</string>

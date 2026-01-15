@@ -4,10 +4,8 @@ import com.kunk.singbox.R
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -23,7 +21,6 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -40,7 +37,6 @@ import androidx.compose.animation.shrinkHorizontally
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Bolt
@@ -58,14 +54,11 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.SmallFloatingActionButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.ScrollableTabRow
-import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.style.TextOverflow
 import android.widget.Toast
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -100,6 +93,8 @@ import androidx.navigation.NavController
 import com.kunk.singbox.model.FilterMode
 import com.kunk.singbox.model.NodeSortType
 import com.kunk.singbox.viewmodel.NodesViewModel
+import com.kunk.singbox.ui.components.AddNodeDialog
+import com.kunk.singbox.ui.components.AddNodeTarget
 import com.kunk.singbox.ui.components.InputDialog
 import com.kunk.singbox.ui.components.NodeFilterDialog
 import com.kunk.singbox.ui.components.SingleSelectDialog
@@ -141,13 +136,12 @@ fun NodesScreen(
 
     val nodes by viewModel.nodes.collectAsState()
     val activeNodeId by viewModel.activeNodeId.collectAsState()
-    val groups by viewModel.nodeGroups.collectAsState()
     val testingNodeIds by viewModel.testingNodeIds.collectAsState()
     val nodeFilter by viewModel.nodeFilter.collectAsState()
     val sortType by viewModel.sortType.collectAsState()
     val testProgress by viewModel.testProgress.collectAsState()
-    
-    var selectedGroupIndex by remember { mutableStateOf(0) }
+    val profiles by viewModel.profiles.collectAsState()
+
     var searchQuery by remember { mutableStateOf("") }
     var isSearchExpanded by remember { mutableStateOf(false) }
     val isTesting by viewModel.isTesting.collectAsState()
@@ -159,26 +153,12 @@ fun NodesScreen(
         }
     }
 
-    // 当groups变化时重置索引，避免越界
-    LaunchedEffect(groups) {
-        if (selectedGroupIndex >= groups.size) {
-            selectedGroupIndex = 0
-        }
-    }
-
     val filteredNodes by remember {
         androidx.compose.runtime.derivedStateOf {
-            val groupFiltered = if (selectedGroupIndex == 0 || groups.isEmpty()) {
+            if (searchQuery.isBlank()) {
                 nodes
             } else {
-                val selectedGroup = groups.getOrNull(selectedGroupIndex)
-                if (selectedGroup == null) nodes else nodes.filter { it.group == selectedGroup }
-            }
-
-            if (searchQuery.isBlank()) {
-                groupFiltered
-            } else {
-                groupFiltered.filter { node ->
+                nodes.filter { node ->
                     node.displayName.contains(searchQuery, ignoreCase = true)
                 }
             }
@@ -213,12 +193,23 @@ fun NodesScreen(
     }
 
     if (showAddNodeDialog) {
-        InputDialog(
-            title = stringResource(R.string.nodes_add),
-            placeholder = stringResource(R.string.nodes_add_hint),
-            confirmText = stringResource(R.string.common_add),
-            onConfirm = {
-                viewModel.addNode(it)
+        AddNodeDialog(
+            profiles = profiles,
+            onConfirm = { nodeLink, target ->
+                when (target) {
+                    is AddNodeTarget.ExistingProfile -> {
+                        viewModel.addNode(
+                            content = nodeLink,
+                            targetProfileId = target.profileId
+                        )
+                    }
+                    is AddNodeTarget.NewProfile -> {
+                        viewModel.addNode(
+                            content = nodeLink,
+                            newProfileName = target.profileName
+                        )
+                    }
+                }
                 showAddNodeDialog = false
             },
             onDismiss = { showAddNodeDialog = false }
@@ -439,7 +430,7 @@ fun NodesScreen(
                 )
 
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    // 筛选按钮（替换原来的启动按钮）
+                    // 筛选按钮
                     IconButton(onClick = { showFilterDialog = true }) {
                         val hasFilter = nodeFilter.filterMode != FilterMode.NONE
                         Icon(
@@ -454,39 +445,17 @@ fun NodesScreen(
                 }
             }
 
-            // 2. Group Tabs
-            ScrollableTabRow(
-                selectedTabIndex = selectedGroupIndex,
-                contentColor = MaterialTheme.colorScheme.onBackground,
-                modifier = Modifier.background(MaterialTheme.colorScheme.background),
-                edgePadding = 16.dp,
-                divider = {},
-                indicator = {}
-            ) {
-                groups.forEachIndexed { index, title ->
-                    Tab(
-                        selected = selectedGroupIndex == index,
-                        onClick = { selectedGroupIndex = index },
-                        modifier = Modifier.pointerInput(Unit) {
-                            detectTapGestures(
-                                onLongPress = {
-                                    Toast.makeText(context, context.getString(R.string.nodes_group_auto_generated), Toast.LENGTH_LONG).show()
-                                },
-                                onTap = {
-                                    selectedGroupIndex = index
-                                }
-                            )
-                        },
-                        text = {
-                            Text(
-                                text = title,
-                                color = if (selectedGroupIndex == index) MaterialTheme.colorScheme.onBackground else MaterialTheme.colorScheme.onSurfaceVariant,
-                                fontWeight = if (selectedGroupIndex == index) FontWeight.Bold else FontWeight.Normal
-                            )
-                        }
-                    )
-                }
-            }
+            // 2. Search Bar (在标题下方)
+            NodeSearchBar(
+                query = searchQuery,
+                onQueryChange = { searchQuery = it },
+                isExpanded = isSearchExpanded,
+                onToggle = { isSearchExpanded = !isSearchExpanded },
+                totalCount = nodes.size,
+                filteredCount = filteredNodes.size,
+                activeNodeName = nodes.find { it.id == activeNodeId }?.displayName,
+                modifier = Modifier.padding(horizontal = 16.dp)
+            )
 
             AnimatedVisibility(
                 visible = testProgress != null,
@@ -537,7 +506,7 @@ fun NodesScreen(
                 ) {
                 itemsIndexed(
                     items = filteredNodes,
-                    key = { index, node -> "${node.id}_$index" },
+                    key = { _, node -> node.id },
                     contentType = { _, _ -> "node" }
                 ) { index, node ->
                     val isSelected = activeNodeId == node.id
@@ -597,35 +566,20 @@ fun NodesScreen(
                     )
                 }
             }
-
-                androidx.compose.animation.AnimatedVisibility(
-                    visible = isFabVisible,
-                    enter = fadeIn(),
-                    exit = fadeOut(),
-                    modifier = Modifier
-                        .align(Alignment.TopStart)
-                        .padding(start = 16.dp, end = 16.dp, top = 12.dp)
-                ) {
-                    ExpandableNodeSearchBar(
-                        query = searchQuery,
-                        onQueryChange = { searchQuery = it },
-                        isExpanded = isSearchExpanded,
-                        onToggle = {
-                            isSearchExpanded = !isSearchExpanded
-                        }
-                    )
-                }
-            }
         }
+    }
     }
 }
 
 @Composable
-private fun ExpandableNodeSearchBar(
+private fun NodeSearchBar(
     query: String,
     onQueryChange: (String) -> Unit,
     isExpanded: Boolean,
     onToggle: () -> Unit,
+    totalCount: Int,
+    filteredCount: Int,
+    activeNodeName: String?,
     modifier: Modifier = Modifier
 ) {
     Box(
@@ -645,6 +599,59 @@ private fun ExpandableNodeSearchBar(
                 tint = if (isExpanded) MaterialTheme.colorScheme.primary else Neutral500,
                 modifier = Modifier.size(24.dp)
             )
+        }
+
+        // 未展开时显示统计信息
+        AnimatedVisibility(
+            visible = !isExpanded,
+            enter = fadeIn(),
+            exit = fadeOut(),
+            modifier = Modifier
+                .padding(start = 48.dp, end = 8.dp)
+                .fillMaxWidth()
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                // 节点数量统计
+                Text(
+                    text = if (filteredCount != totalCount) {
+                        "$filteredCount / $totalCount ${stringResource(R.string.nodes_count_suffix)}"
+                    } else {
+                        "$totalCount ${stringResource(R.string.nodes_count_suffix)}"
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Neutral500
+                )
+
+                // 活跃节点
+                if (activeNodeName != null) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(start = 8.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(6.dp)
+                                .background(
+                                    color = MaterialTheme.colorScheme.primary,
+                                    shape = RoundedCornerShape(3.dp)
+                                )
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = activeNodeName,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.primary,
+                            maxLines = 1,
+                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false)
+                        )
+                    }
+                }
+            }
         }
 
         // 右侧胶囊搜索框(仅展开时显示,从左侧按钮右边开始)
