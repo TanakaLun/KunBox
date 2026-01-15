@@ -91,6 +91,7 @@ data class Inbound(
     @SerializedName("sniff_timeout") val sniffTimeout: String? = null,
     @SerializedName("tcp_fast_open") val tcpFastOpen: Boolean? = null,
     @SerializedName("endpoint_independent_nat") val endpointIndependentNat: Boolean? = null,
+    @SerializedName("gso") val gso: Boolean? = null,
     @SerializedName("users") val users: List<InboundUser>? = null
 ) {
     val inet4Address: List<String>?
@@ -239,6 +240,8 @@ data class TlsConfig(
     @SerializedName("server_name") val serverName: String? = null,
     @SerializedName("insecure") val insecure: Boolean? = null,
     @SerializedName("alpn") val alpn: List<String>? = null,
+    @SerializedName("min_version") val minVersion: String? = null,  // TLS 版本限制: "1.2" 或 "1.3"
+    @SerializedName("max_version") val maxVersion: String? = null,
     @SerializedName("utls") val utls: UtlsConfig? = null,
     @SerializedName("reality") val reality: RealityConfig? = null,
     @SerializedName("ech") val ech: EchConfig? = null,
