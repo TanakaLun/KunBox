@@ -21,6 +21,7 @@ import com.kunk.singbox.model.AppThemeMode
 import com.kunk.singbox.model.AppLanguage
 import com.kunk.singbox.model.NodeSortType
 import com.kunk.singbox.model.NodeFilter
+import com.kunk.singbox.model.BackgroundPowerSavingDelay
 import com.kunk.singbox.repository.store.SettingsStore
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
@@ -33,8 +34,7 @@ import kotlinx.coroutines.flow.StateFlow
 /**
  * 设置仓库 - 提供设置的读写接口
  *
- * 内部使用 SettingsStore (Kryo 序列化) 存储设置
- * 相比旧的 DataStore + Gson 方案，性能提升 10x+
+ * 内部使用 SettingsStore (Room 数据库) 存储设置
  */
 class SettingsRepository(private val context: Context) {
 
@@ -345,6 +345,12 @@ class SettingsRepository(private val context: Context) {
 
     suspend fun setAutoCheckUpdate(value: Boolean) {
         settingsStore.updateSettingsAndWait { it.copy(autoCheckUpdate = value) }
+    }
+
+    // ==================== 后台省电设置 ====================
+
+    suspend fun setBackgroundPowerSavingDelay(value: BackgroundPowerSavingDelay) {
+        settingsStore.updateSettingsAndWait { it.copy(backgroundPowerSavingDelay = value) }
     }
 
     // ==================== 节点列表设置 ====================
