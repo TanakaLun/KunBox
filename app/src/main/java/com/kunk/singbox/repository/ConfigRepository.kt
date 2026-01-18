@@ -22,8 +22,11 @@ import com.kunk.singbox.utils.parser.SingBoxParser
 import com.kunk.singbox.repository.config.OutboundFixer
 import com.kunk.singbox.repository.config.InboundBuilder
 import com.kunk.singbox.utils.parser.SubscriptionManager
-import com.kunk.singbox.utils.KryoSerializer
 import com.kunk.singbox.repository.TrafficRepository
+import com.kunk.singbox.database.AppDatabase
+import com.kunk.singbox.database.entity.ProfileEntity
+import com.kunk.singbox.database.entity.ActiveStateEntity
+import com.kunk.singbox.database.entity.NodeLatencyEntity
 import java.io.File
 import java.util.Collections
 import java.util.UUID
@@ -40,6 +43,7 @@ import com.kunk.singbox.utils.NetworkClient
 import com.kunk.singbox.utils.StringBuilderPool
 import org.yaml.snakeyaml.Yaml
 import org.yaml.snakeyaml.error.YAMLException
+import com.tencent.mmkv.MMKV
 
 /**
  * 配置仓库 - 负责获取、解析和存储配置
@@ -75,6 +79,9 @@ class ConfigRepository(private val context: Context) {
         private val REGEX_ED_EXTRACT = Regex("""[?&]ed=(\d+)""")
         private val REGEX_SS_OLD_FORMAT = Regex("(.+):(.+)@(.+):(\\d+)")
         private val REGEX_WHITESPACE_DASH = Regex("[\\s\\-_]")
+
+        private val TYPE_SAVED_PROFILES_DATA = object : TypeToken<SavedProfilesData>() {}.type
+        private val TYPE_OUTBOUND_LIST = object : TypeToken<List<Outbound>>() {}.type
 
         // 预编译的地区检测规则 - 避免每次调用都编译 Regex
         private data class RegionRule(
@@ -114,11 +121,27 @@ class ConfigRepository(private val context: Context) {
             .flatMap { it.wordBoundaryKeywords }
             .associateWith { word -> Regex("(^|[^a-z])${Regex.escape(word)}([^a-z]|$)") }
 
-        // 地区检测缓存
-        private val regionFlagCache = ConcurrentHashMap<String, String>()
+        // LRU 缓存大小限制，防止节点数量过多时内存膨胀
+        private const val MAX_REGION_FLAG_CACHE_SIZE = 2000
+        private const val MAX_NODE_ID_CACHE_SIZE = 2000
 
-        // stableNodeId 缓存
-        private val nodeIdCache = ConcurrentHashMap<String, String>()
+        // 地区检测缓存 - 使用 LRU 淘汰机制
+        private val regionFlagCache: MutableMap<String, String> = Collections.synchronizedMap(
+            object : LinkedHashMap<String, String>(MAX_REGION_FLAG_CACHE_SIZE, 0.75f, true) {
+                override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean {
+                    return size > MAX_REGION_FLAG_CACHE_SIZE
+                }
+            }
+        )
+
+        // stableNodeId 缓存 - 使用 LRU 淘汰机制
+        private val nodeIdCache: MutableMap<String, String> = Collections.synchronizedMap(
+            object : LinkedHashMap<String, String>(MAX_NODE_ID_CACHE_SIZE, 0.75f, true) {
+                override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean {
+                    return size > MAX_NODE_ID_CACHE_SIZE
+                }
+            }
+        )
 
         /**
          * 生成稳定的节点 ID（基于 profileId 和 outboundTag 的 UUID）
@@ -126,11 +149,14 @@ class ConfigRepository(private val context: Context) {
          */
         fun stableNodeId(profileId: String, outboundTag: String): String {
             val key = "$profileId|$outboundTag"
-            return nodeIdCache.getOrPut(key) {
-                StringBuilderPool.use { sb ->
+            synchronized(nodeIdCache) {
+                nodeIdCache[key]?.let { return it }
+                val id = StringBuilderPool.use { sb ->
                     sb.append(profileId).append('|').append(outboundTag)
                     java.util.UUID.nameUUIDFromBytes(sb.toString().toByteArray(Charsets.UTF_8)).toString()
                 }
+                nodeIdCache[key] = id
+                return id
             }
         }
 
@@ -157,6 +183,12 @@ class ConfigRepository(private val context: Context) {
     private val gson = Gson()
     private val singBoxCore = SingBoxCore.getInstance(context)
     private val settingsRepository = SettingsRepository.getInstance(context)
+
+    // Room 数据库
+    private val database = AppDatabase.getInstance(context)
+    private val profileDao = database.profileDao()
+    private val activeStateDao = database.activeStateDao()
+    private val nodeLatencyDao = database.nodeLatencyDao()
 
     /**
      * 缓存的设置值 - 避免在同步方法中使用 runBlocking
@@ -259,6 +291,12 @@ class ConfigRepository(private val context: Context) {
     // 缓存上一次运行的配置 ID，用于判断是否跨配置切换
     @Volatile private var lastRunProfileId: String? = null
 
+    // 配置级别的节点选择记忆 - 记录每个配置上次选中的节点
+    private val profileLastSelectedNode = ConcurrentHashMap<String, String>()
+    private val profileNodeMemoryMmkv: MMKV by lazy {
+        MMKV.mmkvWithID("profile_node_memory", MMKV.SINGLE_PROCESS_MODE)
+    }
+
     fun resolveNodeNameFromOutboundTag(tag: String?): String? {
         if (tag.isNullOrBlank()) return null
         if (tag.equals("PROXY", ignoreCase = true)) return null
@@ -276,21 +314,12 @@ class ConfigRepository(private val context: Context) {
     private val configDir: File
         get() = File(context.filesDir, "configs").also { it.mkdirs() }
 
-    // Kryo 二进制格式的配置文件
-    private val profilesFileKryo: File
-        get() = File(context.filesDir, "profiles.kryo")
-
-    // JSON 格式的配置文件（用于向后兼容和迁移）
+    // JSON 格式的配置文件（用于旧数据迁移）
     private val profilesFileJson: File
         get() = File(context.filesDir, "profiles.json")
 
-    // 优先使用 Kryo 格式，如果不存在则回退到 JSON
-    private val profilesFile: File
-        get() = if (profilesFileKryo.exists()) profilesFileKryo else profilesFileJson
-    
     init {
-        // 注册 Kryo 版本迁移器
-        registerKryoMigrators()
+        loadProfileNodeMemory()
         loadSavedProfiles()
 
         // 订阅设置变化，自动更新缓存 (性能优化: 避免 getClient 中使用 runBlocking)
@@ -301,29 +330,22 @@ class ConfigRepository(private val context: Context) {
         }
     }
 
-    /**
-     * 注册 Kryo 数据版本迁移器
-     * 当 SavedProfilesData 结构发生变化时，在此添加迁移逻辑
-     *
-     * 使用方法:
-     * 1. 修改 SavedProfilesData 结构后，递增 KryoSerializer.CURRENT_VERSION
-     * 2. 在此注册从旧版本到新版本的迁移器
-     */
-    private fun registerKryoMigrators() {
-        // 版本 0 -> 1: 旧格式(无魔数)迁移到新格式
-        // 当前数据结构不变，仅添加文件头，无需特殊处理
-        KryoSerializer.registerMigrator(0) { data -> data }
+    private fun loadProfileNodeMemory() {
+        profileNodeMemoryMmkv.allKeys()?.forEach { profileId ->
+            val nodeId = profileNodeMemoryMmkv.decodeString(profileId, null)
+            if (!nodeId.isNullOrBlank()) {
+                profileLastSelectedNode[profileId] = nodeId
+            }
+        }
+    }
 
-        // 未来版本迁移示例:
-        // KryoSerializer.registerMigrator(1) { data ->
-        //     when (data) {
-        //         is SavedProfilesData -> {
-        //             // 例如: 添加新字段 newField
-        //             data.copy(newField = "defaultValue")
-        //         }
-        //         else -> data
-        //     }
-        // }
+    private fun saveProfileNodeMemory(profileId: String, nodeId: String) {
+        profileLastSelectedNode[profileId] = nodeId
+        profileNodeMemoryMmkv.encode(profileId, nodeId)
+    }
+
+    private fun getProfileLastSelectedNode(profileId: String): String? {
+        return profileLastSelectedNode[profileId]
     }
     
     private fun loadConfig(profileId: String): SingBoxConfig? {
@@ -375,45 +397,49 @@ class ConfigRepository(private val context: Context) {
 
     private fun saveProfilesInternal() {
         try {
+            val startTime = System.currentTimeMillis()
+            val profiles = _profiles.value
+            val activeProfileId = _activeProfileId.value
+            val activeNodeId = _activeNodeId.value
+
             // 收集所有节点的延迟数据
             val latencies = mutableMapOf<String, Long>()
             profileNodes.values.flatten().forEach { node ->
                 node.latencyMs?.let { latencies[node.id] = it }
             }
 
-            val data = SavedProfilesData(
-                profiles = _profiles.value,
-                activeProfileId = _activeProfileId.value,
-                activeNodeId = _activeNodeId.value,
-                nodeLatencies = latencies
-            )
+            // 同步保存活跃状态 - 确保节点切换后立即持久化，防止应用被杀后丢失
+            try {
+                activeStateDao.saveSync(ActiveStateEntity(
+                    id = 1,
+                    activeProfileId = activeProfileId,
+                    activeNodeId = activeNodeId
+                ))
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to save active state synchronously", e)
+            }
 
-            // 使用 Kryo 二进制序列化（更快、更小）
-            val success = KryoSerializer.serializeToFile(data, profilesFileKryo)
-
-            if (success) {
-                // 成功保存 Kryo 格式后，删除旧的 JSON 文件
-                if (profilesFileJson.exists()) {
-                    profilesFileJson.delete()
-                }
-            } else {
-                // Kryo 失败时回退到 JSON
-                Log.w(TAG, "Kryo serialization failed, falling back to JSON")
-                val json = gson.toJson(data)
-                val tmpFile = File(profilesFileJson.parent, "${profilesFileJson.name}.tmp")
+            // 异步保存其他数据到 Room 数据库
+            scope.launch {
                 try {
-                    tmpFile.writeText(json)
-                    if (tmpFile.exists() && tmpFile.length() > 0) {
-                        if (profilesFileJson.exists()) {
-                            profilesFileJson.delete()
-                        }
-                        if (!tmpFile.renameTo(profilesFileJson)) {
-                            tmpFile.copyTo(profilesFileJson, overwrite = true)
-                            tmpFile.delete()
-                        }
+                    // 保存 Profiles
+                    val entities = profiles.mapIndexed { index, profile ->
+                        ProfileEntity.fromUiModel(profile, sortOrder = index)
                     }
+                    profileDao.insertAll(entities)
+
+                    // 保存延时数据
+                    if (latencies.isNotEmpty()) {
+                        val latencyEntities = latencies.map { (nodeId, latency) ->
+                            NodeLatencyEntity(nodeId = nodeId, latencyMs = latency)
+                        }
+                        nodeLatencyDao.insertAll(latencyEntities)
+                    }
+
+                    val elapsed = System.currentTimeMillis() - startTime
+                    Log.d(TAG, "Saved ${profiles.size} profiles to Room in ${elapsed}ms")
                 } catch (e: Exception) {
-                    Log.e(TAG, "JSON fallback also failed", e)
+                    Log.e(TAG, "Failed to save profiles to Room", e)
                 }
             }
         } catch (e: Exception) {
@@ -491,17 +517,35 @@ class ConfigRepository(private val context: Context) {
     }
 
     private fun updateLatencyInAllNodes(nodeId: String, latency: Long) {
-        // 同步更新 savedNodeLatencies，确保退出节点页面再进入时延时数据仍然可用
-        if (latency > 0) {
-            savedNodeLatencies[nodeId] = latency
-        } else {
-            savedNodeLatencies[nodeId] = -1L
-        }
+        val latencyValue = if (latency > 0) latency else -1L
+        savedNodeLatencies[nodeId] = latencyValue
         _allNodes.update { list ->
             list.map {
-                if (it.id == nodeId) it.copy(latencyMs = if (latency > 0) latency else -1L) else it
+                if (it.id == nodeId) it.copy(latencyMs = latencyValue) else it
             }
         }
+        // 持久化到 Room 数据库
+        scope.launch {
+            try {
+                nodeLatencyDao.upsert(nodeId, latencyValue)
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to persist latency for $nodeId", e)
+            }
+        }
+    }
+
+    private fun updateNodeLatencyFull(nodeId: String, latency: Long) {
+        val latencyValue = if (latency > 0) latency else -1L
+        _nodes.update { list ->
+            list.map { if (it.id == nodeId) it.copy(latencyMs = latencyValue) else it }
+        }
+        val node = _nodes.value.find { it.id == nodeId }
+        if (node != null) {
+            profileNodes[node.sourceProfileId] = profileNodes[node.sourceProfileId]?.map {
+                if (it.id == nodeId) it.copy(latencyMs = latencyValue) else it
+            } ?: emptyList()
+        }
+        updateLatencyInAllNodes(nodeId, latency)
     }
 
     /**
@@ -514,80 +558,141 @@ class ConfigRepository(private val context: Context) {
 
     private fun loadSavedProfiles() {
         try {
-            val savedData: SavedProfilesData? = when {
-                // 优先尝试 Kryo 格式
-                profilesFileKryo.exists() -> {
-                    KryoSerializer.deserializeFromFile<SavedProfilesData>(profilesFileKryo)
-                }
-                // 回退到 JSON 格式（向后兼容）
-                profilesFileJson.exists() -> {
-                    val json = profilesFileJson.readText()
-                    val savedDataType = object : TypeToken<SavedProfilesData>() {}.type
-                    gson.fromJson<SavedProfilesData>(json, savedDataType)
-                }
-                else -> null
+            val startTime = System.currentTimeMillis()
+
+            // 1. 优先从 Room 数据库加载
+            val profileEntities = profileDao.getAllSync()
+            val activeState = activeStateDao.getSync()
+            val latencyEntities = nodeLatencyDao.getAllSync()
+
+            if (profileEntities.isNotEmpty()) {
+                // 从 Room 加载成功
+                val profiles = profileEntities.map { it.toUiModel().copy(updateStatus = UpdateStatus.Idle) }
+                _profiles.value = profiles
+                _activeProfileId.value = activeState?.activeProfileId
+
+                // 恢复延时数据
+                savedNodeLatencies.clear()
+                latencyEntities.forEach { savedNodeLatencies[it.nodeId] = it.latencyMs }
+
+                val elapsed = System.currentTimeMillis() - startTime
+                Log.i(TAG, "Loaded ${profiles.size} profiles from Room in ${elapsed}ms")
+
+                // 加载活跃配置的节点
+                loadActiveProfileNodes(activeState?.activeProfileId, activeState?.activeNodeId)
+
+                // 清理旧的 JSON 文件
+                cleanupLegacyProfileFiles()
+                return
+            }
+
+            // 2. Room 为空，尝试从 JSON 迁移
+            val savedData: SavedProfilesData? = if (profilesFileJson.exists()) {
+                Log.i(TAG, "Migrating profiles from JSON to Room...")
+                val json = profilesFileJson.readText()
+                gson.fromJson<SavedProfilesData>(json, TYPE_SAVED_PROFILES_DATA)
+            } else {
+                null
             }
 
             if (savedData != null) {
-                // 加载时重置所有配置的更新状态为 Idle，防止因异常退出导致一直显示更新中
-                _profiles.value = savedData.profiles.map {
-                    it.copy(updateStatus = UpdateStatus.Idle)
-                }
+                // 迁移到 Room
+                val profiles = savedData.profiles.map { it.copy(updateStatus = UpdateStatus.Idle) }
+                _profiles.value = profiles
                 _activeProfileId.value = savedData.activeProfileId
 
-                // 保存延时数据到成员变量，供后续 setAllNodesUiActive 使用
                 savedNodeLatencies.clear()
                 savedNodeLatencies.putAll(savedData.nodeLatencies)
 
-                // 加载活跃配置的节点 (异步执行，避免阻塞 init)
-                savedData.profiles.forEach { profile ->
-                    if (profile.id != savedData.activeProfileId) return@forEach
-                    val configFile = File(configDir, "${profile.id}.json")
-                    if (configFile.exists()) {
-                        // 优化: 使用协程异步加载节点，避免 runBlocking 阻塞
-                        scope.launch {
-                            try {
-                                val configJson = configFile.readText()
-                                val config = gson.fromJson(configJson, SingBoxConfig::class.java)
-                                val nodes = extractNodesFromConfig(config, profile.id)
-                                // 恢复延迟数据
-                                val nodesWithLatency = nodes.map { node ->
-                                    val latency = savedData.nodeLatencies[node.id]
-                                    if (latency != null) node.copy(latencyMs = latency) else node
-                                }
-                                profileNodes[profile.id] = nodesWithLatency
-                                cacheConfig(profile.id, config)
+                // 保存到 Room (同步)
+                val entities = profiles.mapIndexed { index, profile ->
+                    ProfileEntity.fromUiModel(profile, sortOrder = index)
+                }
+                profileDao.insertAllSync(entities)
 
-                                // 更新 UI 状态
-                                if (profile.id == _activeProfileId.value) {
-                                    _nodes.value = nodesWithLatency
-                                    val restored = savedData.activeNodeId
-                                    _activeNodeId.value = when {
-                                        !restored.isNullOrBlank() && nodesWithLatency.any { it.id == restored } -> restored
-                                        nodesWithLatency.isNotEmpty() -> nodesWithLatency.first().id
-                                        else -> null
-                                    }
-                                }
-                                if (allNodesUiActiveCount.get() > 0) {
-                                    updateAllNodesAndGroups()
-                                }
-                            } catch (e: Exception) {
-                                Log.e(TAG, "Failed to load config for profile: ${profile.id}", e)
-                            }
-                        }
-                    }
+                // 保存活跃状态
+                if (savedData.activeProfileId != null || savedData.activeNodeId != null) {
+                    activeStateDao.saveSync(ActiveStateEntity(
+                        id = 1,
+                        activeProfileId = savedData.activeProfileId,
+                        activeNodeId = savedData.activeNodeId
+                    ))
                 }
 
-                // 如果从 JSON 加载成功，自动迁移到 Kryo 格式
-                if (profilesFileJson.exists() && !profilesFileKryo.exists()) {
-                    scope.launch {
-                        saveProfilesInternal()
-                        Log.i(TAG, "Migrated profiles from JSON to Kryo format")
-                    }
+                // 保存延时数据
+                val latencies = savedData.nodeLatencies.map { (nodeId, latency) ->
+                    NodeLatencyEntity(nodeId = nodeId, latencyMs = latency)
                 }
+                if (latencies.isNotEmpty()) {
+                    scope.launch { nodeLatencyDao.insertAll(latencies) }
+                }
+
+                val elapsed = System.currentTimeMillis() - startTime
+                Log.i(TAG, "Migrated ${profiles.size} profiles to Room in ${elapsed}ms")
+
+                // 加载活跃配置的节点
+                loadActiveProfileNodes(savedData.activeProfileId, savedData.activeNodeId)
+
+                // 删除旧文件
+                cleanupLegacyProfileFiles()
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to load saved profiles", e)
+        }
+    }
+
+    /**
+     * 加载活跃配置的节点
+     */
+    private fun loadActiveProfileNodes(activeProfileId: String?, activeNodeId: String?) {
+        if (activeProfileId == null) return
+        val configFile = File(configDir, "${activeProfileId}.json")
+        if (!configFile.exists()) return
+
+        scope.launch {
+            try {
+                val configJson = configFile.readText()
+                val config = gson.fromJson(configJson, SingBoxConfig::class.java)
+                val nodes = extractNodesFromConfig(config, activeProfileId)
+                // 恢复延迟数据
+                val nodesWithLatency = nodes.map { node ->
+                    val latency = savedNodeLatencies[node.id]
+                    if (latency != null) node.copy(latencyMs = latency) else node
+                }
+                profileNodes[activeProfileId] = nodesWithLatency
+                cacheConfig(activeProfileId, config)
+
+                // 更新 UI 状态
+                if (activeProfileId == _activeProfileId.value) {
+                    _nodes.value = nodesWithLatency
+                    _activeNodeId.value = when {
+                        !activeNodeId.isNullOrBlank() && nodesWithLatency.any { it.id == activeNodeId } -> activeNodeId
+                        nodesWithLatency.isNotEmpty() -> nodesWithLatency.first().id
+                        else -> null
+                    }
+                }
+                if (allNodesUiActiveCount.get() > 0) {
+                    updateAllNodesAndGroups()
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to load config for profile: $activeProfileId", e)
+            }
+        }
+    }
+
+    /**
+     * 清理旧的 JSON 配置文件
+     */
+    private fun cleanupLegacyProfileFiles() {
+        scope.launch {
+            try {
+                if (profilesFileJson.exists()) {
+                    profilesFileJson.delete()
+                    Log.i(TAG, "Deleted legacy JSON profiles file")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to cleanup legacy profile files", e)
+            }
         }
     }
     
@@ -1123,7 +1228,9 @@ class ConfigRepository(private val context: Context) {
                 val decoded = Base64.decode(s, flags)
                 val text = String(decoded)
                 if (text.isNotBlank()) return text
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                Log.v(TAG, "Base64 decode attempt failed with flags=$flags", e)
+            }
         }
         return null
     }
@@ -1152,8 +1259,7 @@ class ConfigRepository(private val context: Context) {
             // 优先尝试 outbounds 字段
             val outboundsElement = jsonObject.get("outbounds") ?: jsonObject.get("proxies")
             if (outboundsElement != null && outboundsElement.isJsonArray) {
-                val outboundListType = object : TypeToken<List<Outbound>>() {}.type
-                val outbounds: List<Outbound> = gson.fromJson(outboundsElement, outboundListType)
+                val outbounds: List<Outbound> = gson.fromJson(outboundsElement, TYPE_OUTBOUND_LIST)
                 if (outbounds.isNotEmpty()) {
                     return outbounds
                 }
@@ -1324,6 +1430,49 @@ class ConfigRepository(private val context: Context) {
     }
 
     /**
+     * 从配置中提取节点 - 同步版本，用于导入场景
+     */
+    private fun extractNodesFromConfigSync(
+        config: SingBoxConfig,
+        profileId: String
+    ): List<NodeUi> {
+        val outbounds = config.outbounds ?: return emptyList()
+        val trafficRepo = TrafficRepository.getInstance(context)
+
+        // 收集所有 selector 和 urltest 的 outbounds 作为分组
+        val groupOutbounds = outbounds.filter {
+            it.type == "selector" || it.type == "urltest"
+        }
+
+        // 创建节点到分组的映射
+        val nodeToGroup = mutableMapOf<String, String>()
+        groupOutbounds.forEach { group ->
+            group.outbounds?.forEach { nodeName ->
+                nodeToGroup[nodeName] = group.tag
+            }
+        }
+
+        // 过滤出代理节点
+        val proxyTypes = setOf(
+            "shadowsocks", "vmess", "vless", "trojan",
+            "hysteria", "hysteria2", "tuic", "wireguard",
+            "shadowtls", "ssh", "anytls", "http", "socks"
+        )
+
+        // 收集所有被其他 outbound 作为 detour 引用的 tag
+        val detourTags = outbounds.mapNotNull { it.detour }.toSet()
+
+        val validOutbounds = outbounds.filter {
+            it.type in proxyTypes && it.tag !in detourTags
+        }
+        if (validOutbounds.isEmpty()) return emptyList()
+
+        return validOutbounds.mapNotNull { outbound ->
+            createNodeUi(outbound, profileId, nodeToGroup, trafficRepo)
+        }
+    }
+
+    /**
      * 创建单个节点 UI 对象
      */
     private fun createNodeUi(
@@ -1443,6 +1592,12 @@ class ConfigRepository(private val context: Context) {
     }
     
     fun setActiveProfile(profileId: String, targetNodeId: String? = null) {
+        val currentProfileId = _activeProfileId.value
+        val currentNodeId = _activeNodeId.value
+        if (currentProfileId != null && currentNodeId != null && currentProfileId != profileId) {
+            saveProfileNodeMemory(currentProfileId, currentNodeId)
+        }
+
         _activeProfileId.value = profileId
         val cached = profileNodes[profileId]
 
@@ -1451,21 +1606,16 @@ class ConfigRepository(private val context: Context) {
 
             val currentActiveId = _activeNodeId.value
 
-            // 如果指定了目标节点且存在于列表中，直接选中
             if (targetNodeId != null && nodes.any { it.id == targetNodeId }) {
                 _activeNodeId.value = targetNodeId
-            }
-            // 如果当前选中节点在新节点列表中，保持不变
-            else if (currentActiveId != null && nodes.any { it.id == currentActiveId }) {
-                // 不需要修改，已经是正确的值
-            }
-            // 如果当前没有选中节点，或选中的节点不在新列表中，选择第一个
-            else if (nodes.isNotEmpty()) {
-                val oldValue = _activeNodeId.value
-                _activeNodeId.value = nodes.first().id
-                if (oldValue != null) {
-                    Log.w(TAG, "setActiveProfile.updateState: Current activeNodeId=$oldValue not in nodes list, resetting to first node: ${nodes.first().id}")
-                } else {
+            } else if (currentActiveId != null && nodes.any { it.id == currentActiveId }) {
+                // keep current
+            } else {
+                val rememberedNodeId = getProfileLastSelectedNode(profileId)
+                if (rememberedNodeId != null && nodes.any { it.id == rememberedNodeId }) {
+                    _activeNodeId.value = rememberedNodeId
+                } else if (nodes.isNotEmpty()) {
+                    _activeNodeId.value = nodes.first().id
                 }
             }
         }
@@ -1486,7 +1636,7 @@ class ConfigRepository(private val context: Context) {
                 }
             }
         }
-        saveProfiles()
+        saveProfilesImmediate()
     }
     
     sealed class NodeSwitchResult {
@@ -1497,7 +1647,10 @@ class ConfigRepository(private val context: Context) {
 
     fun setActiveNodeIdOnly(nodeId: String) {
         _activeNodeId.value = nodeId
-        saveProfiles()
+        _activeProfileId.value?.let { profileId ->
+            saveProfileNodeMemory(profileId, nodeId)
+        }
+        saveProfilesImmediate()
     }
 
     suspend fun setActiveNode(nodeId: String): Boolean {
@@ -1531,7 +1684,7 @@ class ConfigRepository(private val context: Context) {
         }
 
         _activeNodeId.value = nodeId
-        saveProfiles()
+        saveProfilesImmediate()
 
         val remoteRunning = SingBoxRemote.isRunning.value || SingBoxRemote.isStarting.value
         if (!remoteRunning) {
@@ -1691,15 +1844,24 @@ class ConfigRepository(private val context: Context) {
     fun deleteProfile(profileId: String) {
         // 取消自动更新任务
         com.kunk.singbox.service.SubscriptionAutoUpdateWorker.cancel(context, profileId)
-        
+
         _profiles.update { list -> list.filter { it.id != profileId } }
         removeCachedConfig(profileId)
         profileNodes.remove(profileId)
         updateAllNodesAndGroups()
-        
+
         // 删除配置文件
         File(configDir, "$profileId.json").delete()
-        
+
+        // 从 Room 删除
+        scope.launch {
+            try {
+                profileDao.deleteById(profileId)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to delete profile from Room", e)
+            }
+        }
+
         if (_activeProfileId.value == profileId) {
             val newActiveId = _profiles.value.firstOrNull()?.id
             _activeProfileId.value = newActiveId
@@ -1712,7 +1874,46 @@ class ConfigRepository(private val context: Context) {
         }
         saveProfiles()
     }
-    
+
+    /**
+     * 直接导入配置到 Room 数据库
+     * 用于数据恢复/导入场景，保持原始 Profile ID
+     */
+    fun importProfileDirectly(profile: ProfileUi, config: SingBoxConfig) {
+        val deduplicatedConfig = deduplicateTags(config)
+
+        // 缓存配置
+        cacheConfig(profile.id, deduplicatedConfig)
+
+        // 提取节点
+        val nodes = extractNodesFromConfigSync(deduplicatedConfig, profile.id)
+        profileNodes[profile.id] = nodes
+
+        // 更新内存状态
+        _profiles.update { list ->
+            // 移除同 ID 的旧配置
+            val filtered = list.filter { it.id != profile.id }
+            filtered + profile
+        }
+        updateAllNodesAndGroups()
+
+        // 保存到 Room
+        scope.launch {
+            try {
+                val sortOrder = profileDao.getMaxSortOrder() ?: 0
+                val entity = ProfileEntity.fromUiModel(profile, sortOrder = sortOrder + 1)
+                profileDao.insert(entity)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to save imported profile to Room", e)
+            }
+        }
+
+        // 如果是第一个配置，自动激活
+        if (_activeProfileId.value == null) {
+            setActiveProfile(profile.id)
+        }
+    }
+
     fun toggleProfileEnabled(profileId: String) {
         _profiles.update { list ->
             list.map {
@@ -1755,55 +1956,61 @@ class ConfigRepository(private val context: Context) {
             return prev.await()
         }
 
+        val settings = SettingsRepository.getInstance(context).settings.first()
+        val totalTimeoutMs = settings.latencyTestTimeout.toLong()
+
         try {
             val result = withContext(Dispatchers.IO) {
-                try {
-                    val node = _nodes.value.find { it.id == nodeId }
-                    if (node == null) {
-                        Log.e(TAG, "Node not found: $nodeId")
-                        return@withContext -1L
-                    }
-
-                    val config = loadConfig(node.sourceProfileId)
-                    if (config == null) {
-                        Log.e(TAG, "Config not found for profile: ${node.sourceProfileId}")
-                        return@withContext -1L
-                    }
-
-                    val outbound = config.outbounds?.find { it.tag == node.name }
-                    if (outbound == null) {
-                        Log.e(TAG, "Outbound not found: ${node.name}")
-                        return@withContext -1L
-                    }
-
-                    val fixedOutbound = buildOutboundForRuntime(outbound)
-                    // 传入完整的 outbounds 列表，用于解析依赖（如 SS+ShadowTLS）
-                    val allOutbounds = config.outbounds?.map { buildOutboundForRuntime(it) } ?: emptyList()
-                    val latency = singBoxCore.testOutboundLatency(fixedOutbound, allOutbounds)
-
-                    _nodes.update { list ->
-                        list.map {
-                            if (it.id == nodeId) it.copy(latencyMs = if (latency > 0) latency else -1L) else it
+                withTimeoutOrNull(totalTimeoutMs) {
+                    try {
+                        val node = _nodes.value.find { it.id == nodeId }
+                        if (node == null) {
+                            Log.e(TAG, "Node not found: $nodeId")
+                            return@withTimeoutOrNull -1L
                         }
-                    }
 
-                    profileNodes[node.sourceProfileId] = profileNodes[node.sourceProfileId]?.map {
-                        if (it.id == nodeId) it.copy(latencyMs = if (latency > 0) latency else -1L) else it
-                    } ?: emptyList()
-                    updateLatencyInAllNodes(nodeId, latency)
-                    saveProfiles()
+                        val config = loadConfig(node.sourceProfileId)
+                        if (config == null) {
+                            Log.e(TAG, "Config not found for profile: ${node.sourceProfileId}")
+                            return@withTimeoutOrNull -1L
+                        }
 
-                    latency
-                } catch (e: Exception) {
-                    if (e is kotlinx.coroutines.CancellationException) {
-                        -1L
-                    } else {
+                        val outbound = config.outbounds?.find { it.tag == node.name }
+                        if (outbound == null) {
+                            Log.e(TAG, "Outbound not found: ${node.name}")
+                            return@withTimeoutOrNull -1L
+                        }
+
+                        val fixedOutbound = buildOutboundForRuntime(outbound)
+                        val allOutbounds = config.outbounds?.map { buildOutboundForRuntime(it) } ?: emptyList()
+                        val latency = singBoxCore.testOutboundLatency(fixedOutbound, allOutbounds)
+
+                        _nodes.update { list ->
+                            list.map {
+                                if (it.id == nodeId) it.copy(latencyMs = if (latency > 0) latency else -1L) else it
+                            }
+                        }
+
+                        profileNodes[node.sourceProfileId] = profileNodes[node.sourceProfileId]?.map {
+                            if (it.id == nodeId) it.copy(latencyMs = if (latency > 0) latency else -1L) else it
+                        } ?: emptyList()
+                        updateLatencyInAllNodes(nodeId, latency)
+                        saveProfiles()
+
+                        latency
+                    } catch (e: Exception) {
+                        if (e is kotlinx.coroutines.CancellationException) {
+                            throw e
+                        }
                         Log.e(TAG, "Latency test error for $nodeId", e)
-                        // 2025-debug: 记录详细测速失败原因到日志系统，方便用户排查
                         val nodeName = _nodes.value.find { it.id == nodeId }?.name
-                        com.kunk.singbox.repository.LogRepository.getInstance().addLog(context.getString(R.string.nodes_test_failed, nodeName ?: nodeId) + ": ${e.message}")
+                        LogRepository.getInstance().addLog(context.getString(R.string.nodes_test_failed, nodeName ?: nodeId) + ": ${e.message}")
                         -1L
                     }
+                } ?: run {
+                    Log.w(TAG, "Latency test timeout for $nodeId (${totalTimeoutMs}ms)")
+                    updateNodeLatencyFull(nodeId, -1L)
+                    -1L
                 }
             }
             deferred.complete(result)
@@ -1839,7 +2046,7 @@ class ConfigRepository(private val context: Context) {
         }
     }
 
-    suspend fun testAllNodesLatency(targetNodeIds: List<String>? = null, onNodeComplete: ((String) -> Unit)? = null) = withContext(Dispatchers.IO) {
+    suspend fun testAllNodesLatency(targetNodeIds: List<String>? = null, onNodeComplete: ((nodeId: String, latencyMs: Long) -> Unit)? = null) = withContext(Dispatchers.IO) {
         val allNodes = _nodes.value
         val nodes = if (targetNodeIds != null) {
             allNodes.filter { it.id in targetNodeIds }
@@ -1883,7 +2090,7 @@ class ConfigRepository(private val context: Context) {
             
             updateLatencyInAllNodes(info.nodeId, latency)
 
-            onNodeComplete?.invoke(info.nodeId)
+            onNodeComplete?.invoke(info.nodeId, latencyValue)
         }
 
         saveProfiles()
@@ -2048,9 +2255,15 @@ class ConfigRepository(private val context: Context) {
      */
     suspend fun generateConfigFile(): ConfigGenerationResult? = withContext(Dispatchers.IO) {
         try {
-            val activeId = _activeProfileId.value ?: return@withContext null
+            val activeId = _activeProfileId.value 
+                ?: activeStateDao.getSync()?.activeProfileId 
+                ?: return@withContext null
             val config = loadConfig(activeId) ?: return@withContext null
-            val activeNodeId = _activeNodeId.value
+            
+            // 优先使用内存中的值，若为空则从数据库同步读取（解决异步加载竞态问题）
+            val activeNodeId = _activeNodeId.value 
+                ?: activeStateDao.getSync()?.activeNodeId
+            
             val allNodesSnapshot = _allNodes.value.takeIf { it.isNotEmpty() } ?: loadAllNodesSnapshot()
             val activeNode = _nodes.value.find { it.id == activeNodeId }
                 ?: allNodesSnapshot.find { it.id == activeNodeId }
@@ -2261,7 +2474,7 @@ class ConfigRepository(private val context: Context) {
             }
         }
 
-        return settings.customRules
+        val rules = settings.customRules
             .filter { it.enabled }
             .filter {
                 it.type == RuleType.DOMAIN ||
@@ -2279,6 +2492,7 @@ class ConfigRepository(private val context: Context) {
                 }
 
                 val outbound = resolveOutboundTag(mode, rule.outboundValue)
+                Log.d(TAG, "CustomDomainRule: type=${rule.type}, value=${rule.value}, mode=$mode, outboundValue=${rule.outboundValue}, resolved=$outbound")
                 when (rule.type) {
                     RuleType.DOMAIN -> RouteRule(domain = values, outbound = outbound)
                     RuleType.DOMAIN_SUFFIX -> RouteRule(domainSuffix = values, outbound = outbound)
@@ -2286,6 +2500,8 @@ class ConfigRepository(private val context: Context) {
                     else -> null
                 }
             }
+        Log.d(TAG, "buildCustomDomainRules: generated ${rules.size} rules")
+        return rules
     }
 
     /**
@@ -2607,7 +2823,55 @@ class ConfigRepository(private val context: Context) {
             )
         )
 
-        // 优化：代理类域名的 DNS 处理
+        // 自定义域名规则的 DNS 处理（优先级最高，必须在规则集之前）
+        val customDomainRulesForDns = settings.customRules.filter { it.enabled }.filter {
+            it.type == RuleType.DOMAIN || it.type == RuleType.DOMAIN_SUFFIX || it.type == RuleType.DOMAIN_KEYWORD
+        }
+        Log.d(TAG, "buildRunDns: customDomainRulesForDns.size=${customDomainRulesForDns.size}, fakeDnsEnabled=${settings.fakeDnsEnabled}")
+
+        if (customDomainRulesForDns.isNotEmpty()) {
+            val proxyDomains = mutableListOf<String>()
+            val proxySuffixes = mutableListOf<String>()
+            val directDomains = mutableListOf<String>()
+            val directSuffixes = mutableListOf<String>()
+
+            customDomainRulesForDns.forEach { rule ->
+                val values = rule.value.split("\n", "\r", ",", "，").map { it.trim() }.filter { it.isNotEmpty() }
+                val isProxy = when (rule.outboundMode ?: when (rule.outbound) {
+                    OutboundTag.DIRECT -> RuleSetOutboundMode.DIRECT
+                    OutboundTag.BLOCK -> RuleSetOutboundMode.BLOCK
+                    OutboundTag.PROXY -> RuleSetOutboundMode.PROXY
+                }) {
+                    RuleSetOutboundMode.DIRECT, RuleSetOutboundMode.BLOCK -> false
+                    else -> true
+                }
+                Log.d(TAG, "DNS rule: type=${rule.type}, value=${rule.value}, outboundMode=${rule.outboundMode}, isProxy=$isProxy")
+
+                when (rule.type) {
+                    RuleType.DOMAIN -> if (isProxy) proxyDomains.addAll(values) else directDomains.addAll(values)
+                    RuleType.DOMAIN_SUFFIX -> if (isProxy) proxySuffixes.addAll(values) else directSuffixes.addAll(values)
+                    RuleType.DOMAIN_KEYWORD -> if (isProxy) proxySuffixes.addAll(values) else directSuffixes.addAll(values)
+                    else -> {}
+                }
+            }
+
+            val proxyServerTag = if (settings.fakeDnsEnabled) "fakeip-dns" else "remote"
+            Log.d(TAG, "DNS custom domains: proxyDomains=$proxyDomains, proxySuffixes=$proxySuffixes, directDomains=$directDomains, directSuffixes=$directSuffixes, server=$proxyServerTag")
+            if (proxyDomains.isNotEmpty()) {
+                dnsRules.add(DnsRule(domain = proxyDomains.distinct(), server = proxyServerTag))
+            }
+            if (proxySuffixes.isNotEmpty()) {
+                dnsRules.add(DnsRule(domainSuffix = proxySuffixes.distinct(), server = proxyServerTag))
+            }
+            if (directDomains.isNotEmpty()) {
+                dnsRules.add(DnsRule(domain = directDomains.distinct(), server = "local"))
+            }
+            if (directSuffixes.isNotEmpty()) {
+                dnsRules.add(DnsRule(domainSuffix = directSuffixes.distinct(), server = "local"))
+            }
+        }
+
+        // 规则集的 DNS 处理（在自定义规则之后）
         val proxyRuleSets = mutableListOf<String>()
         val possibleProxyTags = listOf(
             "geosite-geolocation-!cn", "geosite-google", "geosite-openai", 
@@ -2617,13 +2881,11 @@ class ConfigRepository(private val context: Context) {
             "geosite-disney", "geosite-microsoft", "geosite-amazon"
         )
         possibleProxyTags.forEach { tag ->
-            // 只添加有效且存在的规则集
             if (validRuleSets.any { it.tag == tag }) proxyRuleSets.add(tag)
         }
 
         if (proxyRuleSets.isNotEmpty()) {
             if (settings.fakeDnsEnabled) {
-                // 如果开启了 FakeIP，代理域名必须返回 FakeIP 以支持域名分流规则
                 dnsRules.add(
                     DnsRule(
                         ruleSet = proxyRuleSets,
@@ -2631,7 +2893,6 @@ class ConfigRepository(private val context: Context) {
                     )
                 )
             } else {
-                // 未开启 FakeIP，则使用远程 DNS
                 dnsRules.add(
                     DnsRule(
                         ruleSet = proxyRuleSets,
@@ -2641,7 +2902,6 @@ class ConfigRepository(private val context: Context) {
             }
         }
 
-        // 优化：直连/绕过类域名的 DNS 强制走 local
         val directRuleSets = mutableListOf<String>()
         if (validRuleSets.any { it.tag == "geosite-cn" }) directRuleSets.add("geosite-cn")
         
@@ -2798,6 +3058,14 @@ class ConfigRepository(private val context: Context) {
             when (ruleSet.outboundMode) {
                 RuleSetOutboundMode.NODE -> resolveNodeRefToId(ruleSet.outboundValue)?.let { requiredNodeIds.add(it) }
                 RuleSetOutboundMode.PROFILE -> ruleSet.outboundValue?.let { requiredProfileIds.add(it) }
+                else -> {}
+            }
+        }
+        // 收集自定义域名规则中引用的节点
+        settings.customRules.filter { it.enabled }.forEach { rule ->
+            when (rule.outboundMode) {
+                RuleSetOutboundMode.NODE -> resolveNodeRefToId(rule.outboundValue)?.let { requiredNodeIds.add(it) }
+                RuleSetOutboundMode.PROFILE -> rule.outboundValue?.let { requiredProfileIds.add(it) }
                 else -> {}
             }
         }
@@ -3064,8 +3332,6 @@ class ConfigRepository(private val context: Context) {
             emptyList()
         }
 
-        val dnsTrafficRule = listOf(RouteRule(protocolRaw = listOf("dns"), outbound = "dns-out"))
-
         val adBlockEnabled = settings.blockAds && validRuleSets.any { it.tag == "geosite-category-ads-all" }
         val adBlockRules = if (adBlockEnabled) {
             listOf(RouteRule(ruleSet = listOf("geosite-category-ads-all"), outbound = "block"))
@@ -3081,11 +3347,18 @@ class ConfigRepository(private val context: Context) {
             DefaultRule.PROXY -> listOf(RouteRule(outbound = selectorTag))
         }
 
+        // sing-box 1.10+ 需要显式添加 sniff action 规则来启用协议嗅探
+        // 这是域名分流生效的关键：通过嗅探 TLS/HTTP 协议获取原始域名
+        val sniffRule = listOf(RouteRule(action = "sniff"))
+        
+        // DNS 劫持规则：将 DNS 流量重定向到 sing-box DNS 模块处理
+        val hijackDnsRule = listOf(RouteRule(protocolRaw = listOf("dns"), action = "hijack-dns"))
+
         val allRules = when (settings.routingMode) {
-            RoutingMode.GLOBAL_PROXY -> dnsTrafficRule + adBlockRules
-            RoutingMode.GLOBAL_DIRECT -> dnsTrafficRule + adBlockRules + listOf(RouteRule(outbound = "direct"))
+            RoutingMode.GLOBAL_PROXY -> sniffRule + hijackDnsRule + adBlockRules
+            RoutingMode.GLOBAL_DIRECT -> sniffRule + hijackDnsRule + adBlockRules + listOf(RouteRule(outbound = "direct"))
             RoutingMode.RULE -> {
-                dnsTrafficRule + adBlockRules + quicRule + bypassLanRules + appRoutingRules + customDomainRules + customRuleSetRules + defaultRuleCatchAll
+                sniffRule + hijackDnsRule + adBlockRules + quicRule + bypassLanRules + customDomainRules + appRoutingRules + customRuleSetRules + defaultRuleCatchAll
             }
         }
 
@@ -3910,5 +4183,24 @@ class ConfigRepository(private val context: Context) {
         }
         // 如果都失败，返回原始端口（让 sing-box 报错）
         return startPort
+    }
+
+    /**
+     * 清理资源，取消协程 scope
+     * 
+     * 注意：由于 ConfigRepository 是单例且生命周期与 Application 相同，
+     * 通常不需要手动调用此方法。此方法主要用于：
+     * 1. 测试场景中清理资源
+     * 2. 极端内存压力下的紧急清理
+     */
+    fun cleanup() {
+        scope.cancel()
+        regionFlagCache.clear()
+        nodeIdCache.clear()
+        configCache.clear()
+        profileNodes.clear()
+        savedNodeLatencies.clear()
+        inFlightLatencyTests.clear()
+        Log.i(TAG, "ConfigRepository cleanup completed")
     }
 }

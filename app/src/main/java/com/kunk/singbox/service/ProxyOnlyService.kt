@@ -573,11 +573,12 @@ class ProxyOnlyService : Service() {
         cleanupScope.launch(NonCancellable) {
             try {
                 jobToJoin?.join()
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to close command server", e)
             }
 
             runCatching {
-                try { serviceToClose?.close() } catch (_: Exception) {}
+                try { serviceToClose?.close() } catch (e: Exception) { Log.w(TAG, "Failed to close box service", e) }
             }
 
             withContext(Dispatchers.Main) {
@@ -625,8 +626,10 @@ class ProxyOnlyService : Service() {
         val st = state ?: if (isRunning) SingBoxService.ServiceState.RUNNING else SingBoxService.ServiceState.STOPPED
         val repo = runCatching { ConfigRepository.getInstance(applicationContext) }.getOrNull()
         val activeId = repo?.activeNodeId?.value
+        // 2025-fix: 优先使用 VpnStateStore.getActiveLabel()，然后回退到 configRepository
         val activeLabel = runCatching {
-            if (repo != null && activeId != null) repo.nodes.value.find { it.id == activeId }?.name else ""
+            VpnStateStore.getActiveLabel().takeIf { it.isNotBlank() }
+                ?: if (repo != null && activeId != null) repo.nodes.value.find { it.id == activeId }?.name else ""
         }.getOrNull().orEmpty()
 
         SingBoxIpcHub.update(
@@ -650,7 +653,9 @@ class ProxyOnlyService : Service() {
             val manager = getSystemService(NotificationManager::class.java)
             try {
                 manager.deleteNotificationChannel(LEGACY_CHANNEL_ID)
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to delete legacy notification channel", e)
+            }
 
             val channel = NotificationChannel(
                 CHANNEL_ID,

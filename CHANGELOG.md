@@ -1,5 +1,52 @@
 # Changelog
 
+## [2.4.3](https://github.com/roseforljh/KunBox/compare/v2.4.2...v2.4.3) (2026-01-18)
+
+
+### Bug Fixes
+
+* **db:** remove foreign key constraint to fix node latency persistence ([663966c](https://github.com/roseforljh/KunBox/commit/663966c415133a671754d69b4475fd5653d1a385))
+
+## [2.4.2](https://github.com/roseforljh/KunBox/compare/v2.4.1...v2.4.2) (2026-01-17)
+
+
+### Bug Fixes
+
+* **data:** persist node latency and improve update check ([2a21b55](https://github.com/roseforljh/KunBox/commit/2a21b5519d4ebb858dd6798e1f71cefd418b2e51))
+* **power:** enable main process self-termination for power saving ([549e079](https://github.com/roseforljh/KunBox/commit/549e079d8d54f91a1d282128a5fcdec697b68356))
+
+## [2.4.1](https://github.com/roseforljh/KunBox/compare/v2.4.0...v2.4.1) (2026-01-17)
+
+
+### Bug Fixes
+
+* **ipc:** resolve UI stuck loading after Doze wake and proxy idle ([f834ff9](https://github.com/roseforljh/KunBox/commit/f834ff9b482b47dde81abaf245bcf68f268f0e07))
+* **latency:** enforce user-configured timeout for single node test ([d2ce2b4](https://github.com/roseforljh/KunBox/commit/d2ce2b48beed652eeab54650f4b9f325dae802f9))
+* **latency:** pass latency value directly in callback to fix race condition ([79a3ab6](https://github.com/roseforljh/KunBox/commit/79a3ab6a445474e58e293358069be4ad71498513))
+* **memory:** optimize memory usage with LRU caches and static TypeTokens ([e8d4f87](https://github.com/roseforljh/KunBox/commit/e8d4f872b2970d37a25423b927da4cd54e4e890f))
+* **notification:** persist activeLabel to VpnStateStore for cross-process sync ([a2d3b03](https://github.com/roseforljh/KunBox/commit/a2d3b03eb918e108912e8481b2ee03e160fb09c5))
+* **parser:** handle empty string fields in Clash YAML hysteria2 nodes ([8910bac](https://github.com/roseforljh/KunBox/commit/8910bac91b3dbf8781e99950253218ece012a274))
+* **power:** add background power saving with configurable delay ([572e921](https://github.com/roseforljh/KunBox/commit/572e9214c35483bf2296d28b084204b06c0bc1b2))
+
+## [2.4.0](https://github.com/roseforljh/KunBox/compare/v2.3.1...v2.4.0) (2026-01-17)
+
+
+### Features
+
+* **core:** add kernel-level hot reload for config changes ([4a059bc](https://github.com/roseforljh/KunBox/commit/4a059bcefe2fdd9c9aa21701b5e9306137c46b2e))
+* **routing:** smart domain recognition + fix domain routing priority ([63bbfc4](https://github.com/roseforljh/KunBox/commit/63bbfc4674a8bfb86e91c7bb148c28ccf8133e71))
+
+
+### Bug Fixes
+
+* **config:** node state persistence and profile node memory ([7ae5d66](https://github.com/roseforljh/KunBox/commit/7ae5d66e02f6132a537cbe7077d9cb083f14e00a))
+* **parser:** handle multiple links in clipboard import ([b69d0d2](https://github.com/roseforljh/KunBox/commit/b69d0d252e8a55878a8a2ee1fc9bd21f900c124d))
+* **service:** notification bar node switch not working ([fdc36b6](https://github.com/roseforljh/KunBox/commit/fdc36b66496f274e9644f2e52b88aca8de9cc54b))
+* **service:** notification not dismissed when app removed from recents ([a6f55c0](https://github.com/roseforljh/KunBox/commit/a6f55c05e98a17a0a0f2935484793f3d3655b5c3))
+* **shortcut:** node selection and VPN toggle not working from app shortcut ([6099561](https://github.com/roseforljh/KunBox/commit/60995613c0dd048cc3c1249d3bb0173f1b173c55))
+* **vpn:** hot reload failure causes network loss ([42d4d14](https://github.com/roseforljh/KunBox/commit/42d4d1438f242bdb0a8cf4cb0f24aa6e5399f10c))
+* **vpn:** per-app proxy settings not applied to TUN interface ([09d1605](https://github.com/roseforljh/KunBox/commit/09d1605d374c0e331e443f19382b61d98dfdbb36))
+
 ## [2.3.1](https://github.com/roseforljh/KunBox/compare/v2.3.0...v2.3.1) (2026-01-15)
 
 

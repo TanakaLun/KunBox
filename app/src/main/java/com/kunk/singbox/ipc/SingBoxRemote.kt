@@ -332,19 +332,31 @@ object SingBoxRemote {
 
     /**
      * NekoBox 风格: 强制重新绑定
+     * 
+     * Fix B: Doze 唤醒后强制重新注册 callback，确保 IPC 回调通道畅通
      */
     fun rebind(context: Context) {
         contextRef = WeakReference(context.applicationContext)
         reconnectAttempts = 0
 
-        if (connectionActive && bound && service != null) {
-            val isAlive = runCatching {
-                syncStateFromService(service!!)
-                true
-            }.getOrDefault(false)
+        val s = service
+        if (connectionActive && bound && s != null) {
+            val isAlive = runCatching { s.state; true }.getOrDefault(false)
 
             if (isAlive) {
-                Log.i(TAG, "Rebind: connection alive, state synced")
+                runCatching {
+                    if (callbackRegistered) {
+                        s.unregisterCallback(callback)
+                    }
+                    s.registerCallback(callback)
+                    callbackRegistered = true
+                    syncStateFromService(s)
+                    Log.i(TAG, "Rebind: callback re-registered, state synced")
+                }.onFailure {
+                    Log.w(TAG, "Rebind: re-register failed, forcing reconnect", it)
+                    disconnect(context)
+                    connect(context)
+                }
                 return
             }
         }
@@ -363,4 +375,22 @@ object SingBoxRemote {
     }
 
     fun getLastSyncAge(): Long = System.currentTimeMillis() - lastSyncTimeMs
+
+    /**
+     * 通知 :bg 进程 App 生命周期变化
+     * 用于触发省电模式
+     */
+    fun notifyAppLifecycle(isForeground: Boolean) {
+        val s = service
+        if (s != null && connectionActive && bound) {
+            runCatching {
+                s.notifyAppLifecycle(isForeground)
+                Log.d(TAG, "notifyAppLifecycle: isForeground=$isForeground")
+            }.onFailure {
+                Log.w(TAG, "Failed to notify app lifecycle", it)
+            }
+        } else {
+            Log.d(TAG, "notifyAppLifecycle: service not connected, skip")
+        }
+    }
 }
